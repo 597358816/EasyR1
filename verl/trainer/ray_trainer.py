@@ -18,7 +18,7 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import os
 import uuid
-from collections import defaultdict
+from collections import defaultdict, Counter
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -163,6 +163,44 @@ def compute_advantage(data: DataProto, adv_estimator: AdvantageEstimator, gamma:
     data.batch["returns"] = returns
     return data
 
+def _select_by_advantage(batch: DataProto, threshold = 0):
+    advantages = batch.batch["advantages"][:,0]
+    selected_mask = advantages.abs() > threshold
+    selected_indices = selected_mask.nonzero(as_tuple=False).squeeze(-1)
+    print("select sample into by advantage", threshold, ":", len(selected_indices))
+    if len(selected_indices) > 0:
+        return batch.select_by_index(index_list=selected_indices.tolist())
+    else:
+        return None
+
+def _filtering_overlong(batch: DataProto):
+    response_mask_first_col = batch.batch["response_mask"][:, -1]
+    selected_mask = (response_mask_first_col == 0)
+    selected_indices = selected_mask.nonzero(as_tuple=False).squeeze(-1)
+    print("filtering overlong sample nums:", len(batch) - len(selected_indices))
+    if len(selected_indices) > 0:
+        return batch.select_by_index(index_list=selected_indices.tolist())
+    else:
+        return None  
+
+def count_advantage_occurrences(batch: DataProto):
+    advantages = batch.batch["advantages"][:, 0]  # shape: (B,)
+    advantage_list = advantages.cpu().numpy().tolist()
+    advantage_counter = Counter(advantage_list)
+    for k,v in advantage_counter.items():
+        print(k,v)
+    return advantage_counter
+
+def trim_to_multiple(batch: DataProto, s):
+    total = len(batch)
+    target_size = (total // s) * s  # 向下取整
+
+    if total == target_size:
+        return batch
+    print(f"Trimming batch from {total} to {target_size}")
+    return batch.select_by_index(list(range(target_size)))
+
+
 
 @contextmanager
 def _timer(name: str, timing_raw: Dict[str, float]):
@@ -171,6 +209,9 @@ def _timer(name: str, timing_raw: Dict[str, float]):
 
     timing_raw[name] = timer.last
 
+def print_batch(s, batch: DataProto):
+    for k, v in batch.batch.items():
+        print(s,k,v.size())
 
 class RayPPOTrainer:
     """
@@ -525,6 +566,23 @@ class RayPPOTrainer:
         )
         metrics.update(global_balance_stats)
 
+
+    def _update_critic(self, batch: DataProto, timing_raw, metrics):
+        if self.use_critic:
+            with _timer("update_critic", timing_raw):
+                critic_output = self.critic_wg.update_critic(batch)
+
+            critic_metrics = reduce_metrics(critic_output.non_tensor_batch)
+            metrics.update(critic_metrics)
+
+    def _update_actor(self, batch: DataProto, timing_raw, metrics):
+        if self.config.trainer.critic_warmup <= self.global_step:
+            with _timer("update_actor", timing_raw):
+                actor_output = self.actor_rollout_wg.update_actor(batch)
+
+            actor_metrics = reduce_metrics(actor_output.non_tensor_batch)
+            metrics.update(actor_metrics)
+
     def fit(self):
         """
         The training loop of PPO.
@@ -555,6 +613,8 @@ class RayPPOTrainer:
 
                 metrics, timing_raw = {}, {}
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
+                #print
+                print_batch("initial_batch:", batch)
 
                 # pop those keys for generation
                 if "multi_modal_data" in batch.non_tensor_batch.keys():
@@ -594,6 +654,9 @@ class RayPPOTrainer:
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.worker.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
+    
+                    #print
+                    print_batch("gen_batch_output:", gen_batch_output)
                     batch.non_tensor_batch.pop("multi_modal_data", None)
 
                     # compute reward
@@ -618,15 +681,16 @@ class RayPPOTrainer:
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
                     # recompute old_log_probs
-                    with _timer("old", timing_raw):
-                        old_log_probs = self.actor_rollout_wg.compute_log_probs(batch)
-                        batch = batch.union(old_log_probs)
+                    #with _timer("old", timing_raw):
+                    #    old_log_probs = self.actor_rollout_wg.compute_log_probs(batch)
+                    #    batch = batch.union(old_log_probs)
 
                     # compute ref_log_probs
-                    if self.use_reference_policy:
-                        with _timer("ref", timing_raw):
-                            ref_log_probs = self.ref_policy_wg.compute_ref_log_probs(batch)
-                            batch = batch.union(ref_log_probs)
+                    #if self.use_reference_policy:
+                    #    with _timer("ref", timing_raw):
+                    #        ref_log_probs = self.ref_policy_wg.compute_ref_log_probs(batch)
+                    #        batch = batch.union(ref_log_probs)
+
 
                     # compute values
                     if self.use_critic:
@@ -653,62 +717,57 @@ class RayPPOTrainer:
                             lam=self.config.algorithm.lam,
                         )
 
-                        # select high-advantage samples
+                        count_advantage_occurrences(batch)
+                        batch = _select_by_advantage(batch, 0)
+                        batch = _filtering_overlong(batch)
+                        batch = trim_to_multiple(batch, 64)
+                        print("final batch size is:", len(batch))
+                    
+                    # recompute old_log_probs
+                    with _timer("old", timing_raw):
+                        old_log_probs = self.actor_rollout_wg.compute_log_probs(batch)
+                        batch = batch.union(old_log_probs)
 
-                        advantages = batch.batch["advantages"][:,0]
-                        threshold = 1
-                        selected_mask = advantages.abs() > threshold
-                        selected_indices = selected_mask.nonzero(as_tuple=False).squeeze(-1)
-                        print("advantage size:",advantages.size())
-                        print("all sample nums:",len(batch))
-                        print("select sample nums:", len(selected_indices))
-                        if len(selected_indices) > 0:
-                            selected_batch = batch.select_by_index(index_list=selected_indices.tolist())
-                            print("selected_batch size:", len(selected_batch))
-                            self.replay_buffer.add(selected_batch)
-                        print("!!!!!!!!!!!replay buffer capacity is:",self.replay_buffer.size,"!!!!!!!!!!!!!!!!!!!!")
-                        
+                    # compute ref_log_probs
+                    if self.use_reference_policy:
+                        with _timer("ref", timing_raw):
+                            ref_log_probs = self.ref_policy_wg.compute_ref_log_probs(batch)
+                            batch = batch.union(ref_log_probs)
 
-                    # update critic
-                    if self.use_critic:
-                        with _timer("update_critic", timing_raw):
-                            critic_output = self.critic_wg.update_critic(batch)
+                    # select high-advantage samples
+                    self.replay_buffer.add(_select_by_advantage(batch, 1))   
+                    print("replay_buffer size:", self.replay_buffer.size)
 
-                        critic_metrics = reduce_metrics(critic_output.non_tensor_batch)
-                        metrics.update(critic_metrics)
+                    self._update_critic(batch, timing_raw,metrics)
 
-                    # update actor
-                    if self.config.trainer.critic_warmup <= self.global_step:
-                        with _timer("update_actor", timing_raw):
-                            actor_output = self.actor_rollout_wg.update_actor(batch)
+                    self._update_actor(batch, timing_raw,metrics)
+                    
+                    if (self.global_step % 5 == 0 and self.replay_buffer.size == self.replay_buffer.capacity):
+                        print("start replay buffer")
+                        #self.replay_buffer.buffer.batch.pop("old_log_probs")
+                        #self.replay_buffer.buffer.batch.pop("ref_log_probs")
 
-                        actor_metrics = reduce_metrics(actor_output.non_tensor_batch)
-                        metrics.update(actor_metrics)
+                        # recompute old_log_probs
+                        #with _timer("old", timing_raw):
+                        #    old_log_probs = self.actor_rollout_wg.compute_log_probs(self.replay_buffer.buffer)
+                        #    self.replay_buffer.buffer = self.replay_buffer.buffer.union(old_log_probs)
+
+                        # recompute ref_log_probs
+                        #if self.use_reference_policy:
+                        #    with _timer("ref", timing_raw):
+                        #        ref_log_probs = self.ref_policy_wg.compute_ref_log_probs(self.replay_buffer.buffer)
+                        #        self.replay_buffer.buffer = self.replay_buffer.buffer.union(ref_log_probs)
+
+                        self._update_critic(self.replay_buffer.buffer, timing_raw,metrics)
+                        self._update_actor(self.replay_buffer.buffer, timing_raw,metrics)
+                        print("end replay buffer")
 
                     # validate
                     if (
                         self.val_reward_fn is not None
                         and self.config.trainer.val_freq > 0
                         and self.global_step % self.config.trainer.val_freq == 0
-                    ):
-                        if self.replay_buffer.size == 2560:
-                            print("start replaybuffer")
-                            if self.use_critic:
-                                with _timer("update_critic", timing_raw):
-                                    critic_output = self.critic_wg.update_critic(self.replay_buffer.buffer)
-
-                                critic_metrics = reduce_metrics(critic_output.non_tensor_batch)
-                                metrics.update(critic_metrics)
-
-                            # update actor
-                            if self.config.trainer.critic_warmup <= self.global_step:
-                                with _timer("update_actor", timing_raw):
-                                    actor_output = self.actor_rollout_wg.update_actor(self.replay_buffer.buffer)
-
-                                actor_metrics = reduce_metrics(actor_output.non_tensor_batch)
-                                metrics.update(actor_metrics)
-                            print("end replaybuffer")
-                            
+                        ):
                         with _timer("validation", timing_raw):
                             val_metrics = self._validate()
 

@@ -340,8 +340,8 @@ def compute_policy_loss(
             negative_approx_kl, 
             min = np.log(1.0 - clip_ratio_low),
             max = np.log(1.0 + clip_ratio_high)
-            #min = torch.log(torch.tensor(1.0 - clip_ratio_low,dtype=ratio.dtype,device=ratio.device))
-            #max = torch.log(1.0 + torch.clamp(0.1*inverse_old_probs,max = 0.4))
+            #min = torch.log(torch.tensor(1.0 - clip_ratio_low,dtype=ratio.dtype,device=ratio.device)),
+            #max = torch.log(1.0 + torch.clamp(0.1*inverse_old_probs,max = 0.6))
         )
     )
 

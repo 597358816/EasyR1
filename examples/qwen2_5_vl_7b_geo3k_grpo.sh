@@ -11,5 +11,5 @@ python3 -m verl.trainer.main \
     data.val_files=hiyouga/geometry3k@test \
     data.format_prompt="${FORMAT_PROMPT}" \
     worker.actor.model.model_path=${MODEL_PATH} \
-    trainer.experiment_name=test_replaybuffer \
-    trainer.n_gpus_per_node=8
+    trainer.experiment_name=origin+filter0+rollout5 \
+    trainer.n_gpus_per_node=8 \

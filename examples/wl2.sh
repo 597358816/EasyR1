@@ -10,5 +10,6 @@ python3 -m verl.trainer.main \
     data.val_files=WaltonFuture/mathvision-train@test \
     data.format_prompt="${FORMAT_PROMPT}" \
     worker.actor.model.model_path=${MODEL_PATH} \
-    trainer.experiment_name=wl_replaybuffer \
-    trainer.n_gpus_per_node=8
+    trainer.experiment_name=replaybuffer+filter-3k \
+    trainer.n_gpus_per_node=8 \
+    trainer.load_checkpoint_path=/home/dataset-assist-0/wc/EasyR1-main/examples/checkpoints/wl2/replaybuffer+filter-3k/global_step_110

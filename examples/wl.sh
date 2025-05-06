@@ -12,4 +12,5 @@ python3 -m verl.trainer.main \
     worker.actor.model.model_path=${MODEL_PATH} \
     trainer.experiment_name=code-7b-new \
     trainer.n_gpus_per_node=8 \
+    trainer.load_checkpoint_path=/home/dataset-assist-0/wc/EasyR1-main/examples/checkpoints/wl/code-7b-new/global_step_45
 
