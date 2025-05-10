@@ -48,7 +48,7 @@ from ..workers.fsdp_workers import FSDPWorker
 from . import core_algos
 from .config import PPOConfig
 from .metrics import compute_data_metrics, compute_throughout_metrics, compute_timing_metrics, reduce_metrics
-from .replay_buffer import ReplayBuffer
+from .buffer import Buffer
 
 class Role(IntEnum):
     """
@@ -173,6 +173,19 @@ def _select_by_advantage(batch: DataProto, threshold = 0):
     else:
         return None
 
+def _select_hard_prompts(batch: DataProto, rollout_n: int, eps: float = 1e-6):
+    """
+    筛选“难问题”样本：满足 abs(advantage) < eps 且 abs(value) < eps 的样本。
+    """
+    advantages = batch.batch["advantages"][:, 0]  
+    values = batch.batch["token_level_scores"][:, 0]    
+    selected_mask = (advantages.abs() < eps) & (values.abs() < eps)
+    selected_indices = selected_mask.nonzero(as_tuple=False).squeeze(-1)
+    selected_indices = [i.item() for i in selected_indices if i.item() % rollout_n == 0]
+    print(f"select hard prompts:", len(selected_indices))
+    return selected_indices
+
+
 def _filtering_overlong(batch: DataProto):
     response_mask_first_col = batch.batch["response_mask"][:, -1]
     selected_mask = (response_mask_first_col == 0)
@@ -191,16 +204,42 @@ def count_advantage_occurrences(batch: DataProto):
         print(k,v)
     return advantage_counter
 
+def _align_batch_with_buffer(batch: DataProto, buf: Buffer, s):
+    n1 = len(batch)
+    if buf.size < len(batch) % s:
+        batch = trim_to_multiple(batch, s)
+    else:
+        batch = DataProto.concat([batch, buf.sample((s - len(batch) % s) % s)])
+    n2 = len(batch)
+    print(f"align num of samples from {n1} to {n2}")
+    return batch
+
+
 def trim_to_multiple(batch: DataProto, s):
     total = len(batch)
     target_size = (total // s) * s  # 向下取整
-
     if total == target_size:
         return batch
-    print(f"Trimming batch from {total} to {target_size}")
     return batch.select_by_index(list(range(target_size)))
 
+def remove_duplicate_uids(batch: DataProto) -> DataProto:
+    """
+    去除 batch 中 uid 重复的样本，仅保留每个 uid 的第一个出现。
+    """
+    uids = batch.non_tensor_batch.get("uid", None)
+    if uids is None:
+        raise ValueError("non_tensor_batch 中未找到 'uid' 字段，无法去重")
 
+    if isinstance(uids, np.ndarray):
+        uids = uids.tolist()
+    seen = set()
+    unique_indices = []
+    for i, uid in enumerate(uids):
+        if uid not in seen:
+            seen.add(uid)
+            unique_indices.append(i)
+    print(f"origin prompts: {len(uids)}，filtered prompts: {len(unique_indices)}")
+    return batch.select_by_index(unique_indices)
 
 @contextmanager
 def _timer(name: str, timing_raw: Dict[str, float]):
@@ -212,6 +251,8 @@ def _timer(name: str, timing_raw: Dict[str, float]):
 def print_batch(s, batch: DataProto):
     for k, v in batch.batch.items():
         print(s,k,v.size())
+
+    
 
 class RayPPOTrainer:
     """
@@ -583,6 +624,54 @@ class RayPPOTrainer:
             actor_metrics = reduce_metrics(actor_output.non_tensor_batch)
             metrics.update(actor_metrics)
 
+    def _compute_reward(self, batch: DataProto, timing_raw, metrics):
+        with _timer("reward", timing_raw):
+            # we combine with rule-based rm
+            reward_tensor, reward_metrics = self.reward_fn(batch)
+            batch.batch["token_level_scores"] = reward_tensor
+            reward_metrics = {
+                f"reward/{key}": value for key, value in reduce_metrics(reward_metrics).items()
+            }
+            metrics.update(reward_metrics)
+
+    def _compute_old_log_probs(self, batch: DataProto, timing_raw):
+        with _timer("old", timing_raw):
+            old_log_probs = self.actor_rollout_wg.compute_log_probs(batch)
+            batch = batch.union(old_log_probs)
+
+    def _compute_ref_log_probs(self, batch: DataProto, timing_raw):
+        if self.use_reference_policy:
+            with _timer("ref", timing_raw):
+                ref_log_probs = self.ref_policy_wg.compute_ref_log_probs(batch)
+                batch = batch.union(ref_log_probs)
+
+    def _compute_values(self, batch: DataProto, timing_raw):
+        if self.use_critic:
+            with _timer("values", timing_raw):
+                values = self.critic_wg.compute_values(batch)
+                batch = batch.union(values)
+
+    def _compute_adv(self, batch: DataProto, timing_raw):
+        with _timer("adv", timing_raw):
+            # apply kl penalty if available
+            if not self.config.algorithm.use_kl_loss and self.use_reference_policy:
+                # apply kl penalty to reward
+                batch, kl_metrics = apply_kl_penalty(
+                    batch, kl_ctrl=self.kl_ctrl, kl_penalty=self.config.algorithm.kl_penalty
+                )
+                metrics.update(kl_metrics)
+            else:
+                batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+
+            # compute advantages, executed on the driver process
+            batch = compute_advantage(
+                batch,
+                adv_estimator=self.config.algorithm.adv_estimator,
+                gamma=self.config.algorithm.gamma,
+                lam=self.config.algorithm.lam,
+            )
+
+
     def fit(self):
         """
         The training loop of PPO.
@@ -591,7 +680,7 @@ class RayPPOTrainer:
         """
         self.logger = Tracker(loggers=self.config.trainer.logger, config=self.config.to_dict())
         self.global_step = 0
-        self.replay_buffer = ReplayBuffer(capacity=2560)
+        replay_buffer = Buffer(capacity=0)
         val_metrics: Optional[Dict[str, Any]] = None
 
         # load checkpoint before doing anything
@@ -612,18 +701,22 @@ class RayPPOTrainer:
                     break
 
                 metrics, timing_raw = {}, {}
-                batch: DataProto = DataProto.from_single_dict(batch_dict)
+                initial_batch: DataProto = DataProto.from_single_dict(batch_dict)
                 #print
-                print_batch("initial_batch:", batch)
+                print_batch("initial_batch:", initial_batch)
+                for k in initial_batch.non_tensor_batch.keys():
+                    print("non_tensor_keys:",k)
+                for k in initial_batch.meta_info.keys():
+                    print("meta_info:",k)
 
-                # pop those keys for generation
-                if "multi_modal_data" in batch.non_tensor_batch.keys():
-                    gen_batch = batch.pop(
+                 # pop those keys for generation
+                if "multi_modal_data" in initial_batch.non_tensor_batch.keys():
+                    gen_batch = initial_batch.pop(
                         batch_keys=["input_ids", "attention_mask", "position_ids"],
                         non_tensor_batch_keys=["raw_prompt_ids", "multi_modal_data"],
                     )
                 else:
-                    gen_batch = batch.pop(
+                    gen_batch = initial_batch.pop(
                         batch_keys=["input_ids", "attention_mask", "position_ids"],
                         non_tensor_batch_keys=["raw_prompt_ids"],
                     )
@@ -632,134 +725,52 @@ class RayPPOTrainer:
                     # generate a batch
                     with _timer("gen", timing_raw):  # wg: worker group
                         gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                    
 
-                    if self.config.algorithm.adv_estimator == "remax":
-                        with _timer("gen_max", timing_raw):
-                            gen_baseline_batch = deepcopy(gen_batch)
-                            gen_baseline_batch.meta_info["temperature"] = 0
-                            gen_baseline_batch.meta_info["n"] = 1
-                            gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
-
-                            batch = batch.union(gen_baseline_output)
-                            reward_baseline_tensor, _ = self.reward_fn(batch)
-                            reward_baseline_tensor = reward_baseline_tensor.sum(dim=-1)
-
-                            batch.pop(batch_keys=list(gen_baseline_output.batch.keys()))
-                            batch.batch["reward_baselines"] = reward_baseline_tensor
-                            del gen_baseline_batch, gen_baseline_output
-
-                    batch.non_tensor_batch["uid"] = np.array(
-                        [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
+                    initial_batch.non_tensor_batch["uid"] = np.array(
+                        [str(uuid.uuid4()) for _ in range(len(initial_batch.batch))], dtype=object
                     )
-                    # repeat to align with repeated responses in rollout
-                    batch = batch.repeat(repeat_times=self.config.worker.rollout.n, interleave=True)
+                    batch = initial_batch.repeat(repeat_times=self.config.worker.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
-    
-                    #print
                     print_batch("gen_batch_output:", gen_batch_output)
-                    batch.non_tensor_batch.pop("multi_modal_data", None)
-
-                    # compute reward
-                    with _timer("reward", timing_raw):
-                        if self.use_reward_model:
-                            raise NotImplementedError("Reward model is not supported yet.")
-
-                        # we combine with rule-based rm
-                        reward_tensor, reward_metrics = self.reward_fn(batch)
-                        batch.batch["token_level_scores"] = reward_tensor
-                        reward_metrics = {
-                            f"reward/{key}": value for key, value in reduce_metrics(reward_metrics).items()
-                        }
-                        metrics.update(reward_metrics)
-
-                    # balance the number of valid tokens on each dp rank.
-                    # Note that this breaks the order of data inside the batch.
-                    # Please take care when you implement group based adv computation such as GRPO and rloo
-                    self._balance_batch(batch, metrics=metrics)
-
-                    # compute global_valid tokens
+                    self._compute_reward(batch, timing_raw, metrics)
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+                    self._compute_old_log_probs(batch, timing_raw)
+                    self._compute_ref_log_probs(batch, timing_raw)
+                    self._compute_values(batch, timing_raw)
+                    self._compute_adv(batch, timing_raw)
 
-                    # recompute old_log_probs
-                    #with _timer("old", timing_raw):
-                    #    old_log_probs = self.actor_rollout_wg.compute_log_probs(batch)
-                    #    batch = batch.union(old_log_probs)
+                    if replay_buffer.capacity == 0:
+                        replay_buffer.capacity = 2 * len(batch)
+                    count_advantage_occurrences(batch)
+                    medium_advantage_batch = _select_by_advantage(batch, 0.1)
+                    high_advantage_batch = _select_by_advantage(batch, 1)
 
-                    # compute ref_log_probs
-                    #if self.use_reference_policy:
-                    #    with _timer("ref", timing_raw):
-                    #        ref_log_probs = self.ref_policy_wg.compute_ref_log_probs(batch)
-                    #        batch = batch.union(ref_log_probs)
-
-
-                    # compute values
-                    if self.use_critic:
-                        with _timer("values", timing_raw):
-                            values = self.critic_wg.compute_values(batch)
-                            batch = batch.union(values)
-
-                    with _timer("adv", timing_raw):
-                        # apply kl penalty if available
-                        if not self.config.algorithm.use_kl_loss and self.use_reference_policy:
-                            # apply kl penalty to reward
-                            batch, kl_metrics = apply_kl_penalty(
-                                batch, kl_ctrl=self.kl_ctrl, kl_penalty=self.config.algorithm.kl_penalty
-                            )
-                            metrics.update(kl_metrics)
-                        else:
-                            batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
-
-                        # compute advantages, executed on the driver process
-                        batch = compute_advantage(
-                            batch,
-                            adv_estimator=self.config.algorithm.adv_estimator,
-                            gamma=self.config.algorithm.gamma,
-                            lam=self.config.algorithm.lam,
-                        )
-
-                        count_advantage_occurrences(batch)
-                        batch = _select_by_advantage(batch, 0)
-                        batch = _filtering_overlong(batch)
-                        batch = trim_to_multiple(batch, 64)
-                        print("final batch size is:", len(batch))
                     
-                    # recompute old_log_probs
-                    with _timer("old", timing_raw):
-                        old_log_probs = self.actor_rollout_wg.compute_log_probs(batch)
-                        batch = batch.union(old_log_probs)
-
-                    # compute ref_log_probs
-                    if self.use_reference_policy:
-                        with _timer("ref", timing_raw):
-                            ref_log_probs = self.ref_policy_wg.compute_ref_log_probs(batch)
-                            batch = batch.union(ref_log_probs)
-
-                    # select high-advantage samples
-                    self.replay_buffer.add(_select_by_advantage(batch, 1))   
-                    print("replay_buffer size:", self.replay_buffer.size)
-
-                    self._update_critic(batch, timing_raw,metrics)
-
-                    self._update_actor(batch, timing_raw,metrics)
+                    difficult_prompt_indices = _select_hard_prompts(batch, self.config.worker.rollout.n)
                     
-                    if (self.global_step % 5 == 0 and self.replay_buffer.size == self.replay_buffer.capacity):
+                    '''
+                    gen_difficult_batch.meta_info["n"] = 4*self.config.worker.rollout.n
+                    gen_difficult_batch = trim_to_multiple(gen_difficult_batch, 32)
+                    with _timer("gen", timing_raw):  # wg: worker group
+                        gen_difficult_batch_output = self.actor_rollout_wg.generate_sequences(gen_difficult_batch)
+                    print_batch(gen_difficult_batch_output)
+                    '''
+
+                    batch = medium_advantage_batch
+                    batch = _filtering_overlong(batch)
+                    batch = _align_batch_with_buffer(batch, replay_buffer, 32)
+                    print("final batch size is:", len(batch))
+                    replay_buffer.add(high_advantage_batch)   
+                    print("replay_buffer size:", replay_buffer.size)
+
+                    self._update_critic(batch, timing_raw, metrics)
+                    self._update_actor(batch, timing_raw, metrics)
+                    
+                    if (self.global_step % 5 == 0 and replay_buffer.size == replay_buffer.capacity):
                         print("start replay buffer")
-                        #self.replay_buffer.buffer.batch.pop("old_log_probs")
-                        #self.replay_buffer.buffer.batch.pop("ref_log_probs")
-
-                        # recompute old_log_probs
-                        #with _timer("old", timing_raw):
-                        #    old_log_probs = self.actor_rollout_wg.compute_log_probs(self.replay_buffer.buffer)
-                        #    self.replay_buffer.buffer = self.replay_buffer.buffer.union(old_log_probs)
-
-                        # recompute ref_log_probs
-                        #if self.use_reference_policy:
-                        #    with _timer("ref", timing_raw):
-                        #        ref_log_probs = self.ref_policy_wg.compute_ref_log_probs(self.replay_buffer.buffer)
-                        #        self.replay_buffer.buffer = self.replay_buffer.buffer.union(ref_log_probs)
-
-                        self._update_critic(self.replay_buffer.buffer, timing_raw,metrics)
-                        self._update_actor(self.replay_buffer.buffer, timing_raw,metrics)
+                        self._update_critic(replay_buffer.buffer, timing_raw, metrics)
+                        self._update_actor(replay_buffer.buffer, timing_raw, metrics)
                         print("end replay buffer")
 
                     # validate

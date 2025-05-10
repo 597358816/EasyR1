@@ -554,7 +554,7 @@ class DataProto:
         return output
 
     def split(self, split_size: int) -> List["DataProto"]:
-        print("chunk:",len(self),split_size)
+        #print("chunk:",len(self),split_size)
         chunks = len(self) // split_size
         return self.chunk(chunks)
 

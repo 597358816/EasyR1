@@ -73,7 +73,7 @@ worker:
 
 trainer:
   total_episodes: 300
-  logger: ["console","wandb"]
+  logger: ["console"]
   project_name: ReplayBuffer
   experiment_name: qwen2_5_3b_origin
   n_gpus_per_node: 8
