@@ -170,25 +170,29 @@ def _select_by_advantage(batch: DataProto, threshold = 0, absolute = True):
     else:
         selected_mask = advantages > threshold
     selected_indices = selected_mask.nonzero(as_tuple=False).squeeze(-1)
-    print("select sample into by advantage", threshold, ":", len(selected_indices))
+    print("select samples by advantage", threshold, ":", len(selected_indices))
     if len(selected_indices) > 0:
         return batch.select_by_index(index_list=selected_indices.tolist())
     else:
         return None
 
 def _select_hard_prompts(batch: DataProto, rollout_n: int, eps: float = 1e-6):
-    advantages = batch.batch["advantages"][:, 0]  
-    values = batch.batch["token_level_scores"][:, 0]    
+    advantages = batch.batch["advantages"][:, 0]
+    values = batch.batch["token_level_scores"].sum(dim = 1)    
     selected_mask = (advantages.abs() < eps) & (values.abs() < eps)
     selected_indices = selected_mask.nonzero(as_tuple=False).squeeze(-1)
+    n1 = len(selected_indices)
     selected_indices = [i.item() // rollout_n for i in selected_indices if i.item() % rollout_n == 0]
+    n2 = len(selected_indices)
     print(f"select hard prompts:", len(selected_indices))
+    assert n1 == n2 * rollout_n
     return selected_indices
 
 
 def _filtering_overlong(batch: DataProto):
-    response_mask_first_col = batch.batch["response_mask"][:, -1]
-    selected_mask = (response_mask_first_col == 0)
+    advantages = batch.batch["advantages"][:, 0]
+    response_mask_last_col = batch.batch["response_mask"][:, -1]
+    selected_mask = ~((response_mask_last_col == 1) & (advantages > 0))
     selected_indices = selected_mask.nonzero(as_tuple=False).squeeze(-1)
     print("filtering overlong sample nums:", len(batch) - len(selected_indices))
     if len(selected_indices) > 0:
@@ -196,13 +200,13 @@ def _filtering_overlong(batch: DataProto):
     else:
         return None  
 
-def count_advantage_occurrences(batch: DataProto):
-    advantages = batch.batch["advantages"][:, 0]  # shape: (B,)
-    advantage_list = advantages.cpu().numpy().tolist()
-    advantage_counter = Counter(advantage_list)
-    for k,v in advantage_counter.items():
-        print(k,v)
-    return advantage_counter
+def count_occurrences(batch: DataProto, name):
+    occurrences = batch.batch[name][:, 0]  # shape: (B,)
+    occurrences_list = occurrences.cpu().numpy().tolist()
+    occurrences_counter = Counter(occurrences_list)
+    for k,v in occurrences_counter.items():
+        print(name, k, v)
+    return occurrences_counter
 
 def _align_batch_with_buffer(batch: DataProto, buf: Buffer, s):
     n1 = len(batch)
@@ -214,29 +218,14 @@ def _align_batch_with_buffer(batch: DataProto, buf: Buffer, s):
     print(f"align num of samples from {n1} to {n2}")
     return batch
 
-
-def trim_to_multiple(batch: DataProto, s):
+def trim_to_multiple(batch: DataProto, s: int):
     total = len(batch)
-    target_size = (total // s) * s  
+    target_size = (total // s) * s
     if total == target_size:
         return batch
-    return batch.select_by_index(list(range(target_size)))
 
-def remove_duplicate_uids(batch: DataProto) -> DataProto:
-    uids = batch.non_tensor_batch.get("uid", None)
-    if uids is None:
-        raise ValueError("non_tensor_batch 中未找到 'uid' 字段，无法去重")
-
-    if isinstance(uids, np.ndarray):
-        uids = uids.tolist()
-    seen = set()
-    unique_indices = []
-    for i, uid in enumerate(uids):
-        if uid not in seen:
-            seen.add(uid)
-            unique_indices.append(i)
-    print(f"origin prompts: {len(uids)}，filtered prompts: {len(unique_indices)}")
-    return batch.select_by_index(unique_indices)
+    start_idx = total - target_size
+    return batch.select_by_index(list(range(start_idx, total)))
 
 @contextmanager
 def _timer(name: str, timing_raw: Dict[str, float]):
@@ -245,15 +234,17 @@ def _timer(name: str, timing_raw: Dict[str, float]):
 
     timing_raw[name] = timer.last
 
-def print_batch(s, batch: DataProto):
+def print_batch(batch: DataProto, s = ""):
     for k, v in batch.batch.items():
         print(s,k,v.size())
 
 def duplicate_gen_batch(batch: DataProto, n: int):
-    sample_num = (n - len(batch) % n) % n
-    fill_batch = batch.select_by_index([i for i in range(sample_num)])
-    print(f"fill {sample_num} samples")
-    return DataProto.concat([batch, fill_batch])
+    if len(batch) % n > 0:
+        sample_num = (n - len(batch) % n) % n
+        fill_batch = batch.select_by_index([i for i in range(sample_num)])
+        return DataProto.concat([batch, fill_batch])
+    else:
+        return batch
 
     
 
@@ -684,6 +675,8 @@ class RayPPOTrainer:
         self.logger = Tracker(loggers=self.config.trainer.logger, config=self.config.to_dict())
         self.global_step = 0
         replay_buffer = Buffer(capacity=0)
+        batch_buffer = Buffer(capacity=0)
+        rollout_buffer = Buffer(capacity=0)
         val_metrics: Optional[Dict[str, Any]] = None
 
         # load checkpoint before doing anything
@@ -731,69 +724,75 @@ class RayPPOTrainer:
                     initial_batch_size = len(batch)
                     self._compute_reward(batch, timing_raw, metrics)
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
-                    self._compute_old_log_probs(batch, timing_raw)
-                    self._compute_ref_log_probs(batch, timing_raw)
                     self._compute_values(batch, timing_raw)
                     self._compute_adv(batch, timing_raw)
 
                     if replay_buffer.capacity == 0:
-                        replay_buffer.capacity = 2 * len(batch)
-                    count_advantage_occurrences(batch)
+                        replay_buffer.capacity = 2 * initial_batch_size
+                    if batch_buffer.capacity == 0:
+                        batch_buffer.capacity = 2 * initial_batch_size
+                    if rollout_buffer.capacity == 0:
+                        rollout_buffer.capacity = 2 * initial_batch_size
+                    count_occurrences(batch,"advantages")
                     medium_advantage_batch = _select_by_advantage(batch, threshold = 0.1)
-                    high_advantage_batch = _select_by_advantage(batch, threshold = 1)
-
                     # select difficult prompts
                     difficult_prompt_indices = _select_hard_prompts(batch, self.config.worker.rollout.n)
                     gen_difficult_batch = gen_batch.select_by_index(difficult_prompt_indices)
-                    gen_difficult_batch = duplicate_gen_batch(gen_difficult_batch, 32)
-                    gen_difficult_batch.meta_info["temperature"] = 1.2
-                    gen_difficult_batch.meta_info["n"] = 4 * self.config.worker.rollout.n
+
+
+                    if len(gen_difficult_batch) % 32 > 0:
+                        gen_difficult_batch = duplicate_gen_batch(gen_difficult_batch, 32)
+                    rollout_n = max(4 * self.config.worker.rollout.n - max(self.global_step - 100, 0) // 10, 10)
+                    temperature = max(1, 1.2 - max(self.global_step - 100, 0) / 500)
+                    gen_difficult_batch.meta_info["temperature"] = temperature
+                    gen_difficult_batch.meta_info["n"] = rollout_n
                     
 
                     # generate response for difficult prompts
                     with _timer("gen", timing_raw):  # wg: worker group
                         gen_difficult_batch_output = self.actor_rollout_wg.generate_sequences(gen_difficult_batch)
                     
+
                     difficult_batch = initial_batch.select_by_index(difficult_prompt_indices)
                     difficult_batch = duplicate_gen_batch(difficult_batch, 32)
-                    difficult_batch = difficult_batch.repeat(repeat_times = 4 * self.config.worker.rollout.n, interleave=True)
+                    difficult_batch = difficult_batch.repeat(repeat_times = rollout_n, interleave=True)
                     difficult_batch = difficult_batch.union(gen_difficult_batch_output)
 
                     self._compute_reward(difficult_batch, timing_raw, metrics)
                     difficult_batch.meta_info["global_token_num"] = torch.sum(difficult_batch.batch["attention_mask"], dim=-1).tolist()
-                    self._compute_old_log_probs(difficult_batch, timing_raw)
-                    self._compute_ref_log_probs(difficult_batch, timing_raw)
                     self._compute_values(difficult_batch, timing_raw)
                     self._compute_adv(difficult_batch, timing_raw)
-                    count_advantage_occurrences(difficult_batch)
-                    difficult_batch = _select_by_advantage(batch, threshold = 0.5, absolute = True)
+                    count_occurrences(difficult_batch, "advantages")
+                    difficult_batch = _select_by_advantage(difficult_batch, threshold = 1)
                     print("difficult_batch:", len(difficult_batch))
                     
 
                     # union final batch
                     batch = DataProto.concat([difficult_batch, medium_advantage_batch])
                     batch = _filtering_overlong(batch)
-                    
-                    if len(batch) < initial_batch_size / 2 and replay_buffer.size >= initial_batch_size / 2 - len(batch):
-                        n1 = len(batch)
-                        batch = DataProto.concat([batch, replay_buffer.sample(initial_batch_size / 2 - len(batch))])
-                        n1 = len(batch)
-                        print(f"align num of samples from {n1} to {n2} with buffer")
-                    else:
-                        batch = _align_batch_with_buffer(batch, replay_buffer, 64)
-                    print("final batch size is:", len(batch))
-                    replay_buffer.add(high_advantage_batch)
-                    replay_buffer.add(difficult_batch)
-                    print("replay_buffer size:", replay_buffer.size)
 
-                    self._update_critic(batch, timing_raw, metrics)
-                    self._update_actor(batch, timing_raw, metrics)
+                    batch_buffer.add(batch)
+                    if batch_buffer.size >= initial_batch_size:
+                        batch = batch_buffer.pop(initial_batch_size)
+                        self._compute_old_log_probs(batch, timing_raw)
+                        self._compute_ref_log_probs(batch, timing_raw)
+                        high_advantage_batch = _select_by_advantage(batch, threshold = 1)
+                    
+                        print("final batch size is:", len(batch))
+                        self._update_critic(batch, timing_raw, metrics)
+                        self._update_actor(batch, timing_raw, metrics)
+                        replay_buffer.add(high_advantage_batch)
+                        print("replay_buffer size:", replay_buffer.size)
                     
                     # train using replay buffer
-                    if (self.global_step % 5 == 0 and replay_buffer.size == replay_buffer.capacity):
+                    if (self.global_step % 5 == 0 and replay_buffer.size // initial_batch_size > 0):
                         print("start replay buffer")
-                        self._update_critic(replay_buffer.buffer, timing_raw, metrics)
-                        self._update_actor(replay_buffer.buffer, timing_raw, metrics)
+                        if replay_buffer.size == replay_buffer.capacity:
+                            replay_batch = replay_buffer.buffer
+                        else:
+                            replay_batch = replay_buffer.sample((replay_buffer.size // initial_batch_size)* initial_batch_size)
+                        self._update_critic(replay_batch, timing_raw, metrics)
+                        self._update_actor(replay_batch, timing_raw, metrics)
                         print("end replay buffer")
 
                     # validate

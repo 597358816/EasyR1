@@ -339,7 +339,7 @@ def compute_policy_loss(
         torch.clamp(
             negative_approx_kl, 
             min = np.log(1.0 - clip_ratio_low),
-            max = np.log(1.0 + clip_ratio_high)
+            max = np.log(1.0 + 0.2)
             #min = torch.log(torch.tensor(1.0 - clip_ratio_low,dtype=ratio.dtype,device=ratio.device)),
             #max = torch.log(1.0 + torch.clamp(0.1*inverse_old_probs,max = 0.6))
         )
@@ -356,12 +356,19 @@ def compute_policy_loss(
     pg_clipfrac_lower = (clipped_pg_loss_higher > pg_loss3).float() * (advantages < 0).float()
     
     # version of dr.grpo
-
     #final_pg_loss = torch.mean(torch.sum(final_pg_loss * response_mask, dim=-1))/300
     #pg_clipfrac_higher = VF.masked_mean(pg_clipfrac_higher, response_mask)
     #pg_clipfrac_lower = VF.masked_mean(pg_clipfrac_lower, response_mask)
     #ppo_kl = VF.masked_mean(-negative_approx_kl, response_mask)
     #print("this is dr.grpo")
+
+
+    # version of GRPO
+    #final_pg_loss = torch.mean(torch.mean(final_pg_loss * response_mask, dim=-1))
+    #pg_clipfrac_higher = VF.masked_mean(pg_clipfrac_higher, response_mask)
+    #pg_clipfrac_lower = VF.masked_mean(pg_clipfrac_lower, response_mask)
+    #ppo_kl = VF.masked_mean(-negative_approx_kl, response_mask)
+    #print("this is GRPO")
 
     # version of dapo
     final_pg_loss = VF.masked_mean(final_pg_loss, response_mask)

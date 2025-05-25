@@ -23,6 +23,19 @@ class Buffer:
         if self.size > self.capacity:
             self._truncate_to_capacity()
 
+    def pop(self, n: int):
+        if self.buffer is None or self.size == 0:
+            raise ValueError("Buffer is empty.")
+        if n > self.size:
+            raise ValueError(f"Cannot pop {n} items from buffer of size {self.size}.")
+        indices = list(range(n))
+        result = self.buffer.select_by_index(indices)
+        remaining_indices = list(range(n, self.size))
+        self.buffer = self.buffer.select_by_index(remaining_indices) if remaining_indices else None
+        self.size -= n
+
+        return result
+
 
     def sample(self, n: int) -> DataProto:
         assert self.buffer is not None and self.size > 0, "Buffer is empty"

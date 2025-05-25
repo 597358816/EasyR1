@@ -380,10 +380,10 @@ class DataProto:
 
         sub_non_tensor_batch = {}
         for key, value in self.non_tensor_batch.items():
-            if isinstance(value, np.ndarray):
-                sub_non_tensor_batch[key] = value[np.array(index_list)]
-            elif isinstance(value, list):
+            if isinstance(value, list):
                 sub_non_tensor_batch[key] = [value[i] for i in index_list]
+            elif isinstance(value, np.ndarray):
+                sub_non_tensor_batch[key] = value[np.array(index_list)]
             else:
                 sub_non_tensor_batch[key] = value
         if deepcopy:

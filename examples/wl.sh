@@ -2,15 +2,14 @@ set -x
 
 MODEL_PATH=/home/dataset-assist-0/wc/models/Qwen/Qwen2.5-VL-7B-Instruct  # replace it with your local file path
 
-FORMAT_PROMPT="""\nPlease use Matplotlib or seaborn for the drawing. You should make sure that the code can be directly executed without relying on any input data."""
+FORMAT_PROMPT="""You FIRST think about the reasoning process as an internal monologue and then provide the final answer.
+ The reasoning process MUST BE enclosed within <think> </think> tags. The final answer MUST BE put in \boxed{}."""
 
 python3 -m verl.trainer.main \
     config=wl_config.yaml \
-    data.train_files=WaltonFuture/CodeMLLM1@train \
-    data.val_files=WaltonFuture/CodeMLLM1@test \
+    data.train_files=WaltonFuture/MMMT-ThinkLite-3k-random@train \
+    data.val_files=hiyouga/geometry3k@test \
     data.format_prompt="${FORMAT_PROMPT}" \
     worker.actor.model.model_path=${MODEL_PATH} \
-    trainer.experiment_name=code-7b-new \
+    trainer.experiment_name=annealing-clip0.2-wl \
     trainer.n_gpus_per_node=8 \
-    trainer.load_checkpoint_path=/home/dataset-assist-0/wc/EasyR1-main/examples/checkpoints/wl/code-7b-new/global_step_45
-

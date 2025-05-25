@@ -84,7 +84,7 @@ class FunctionRewardManager:
 
             score = self.score_fn(response_str, ground_truth)
             #if len(response_str) > 1536:
-            #    score["overall"] -= min(1, (len(response_str) - 1536) / 512)
+            #    score["overall"] -= min(1, (len(response_str) - 1536) / 1024)
             reward_tensor[i, valid_response_length - 1] = score["overall"]
             for key, value in score.items():
                 reward_metrics[key].append(value)
