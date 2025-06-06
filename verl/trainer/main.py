@@ -65,7 +65,7 @@ class Runner:
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
         reward_fn = FunctionRewardManager(config=config.worker.reward, tokenizer=tokenizer)
-        val_reward_fn = TestRewardManager(config=config.worker.reward, tokenizer=tokenizer)
+        val_reward_fn = FunctionRewardManager(config=config.worker.reward, tokenizer=tokenizer)
 
         trainer = RayPPOTrainer(
             config=config,

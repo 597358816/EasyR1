@@ -176,27 +176,50 @@ def _select_by_advantage(batch: DataProto, threshold = 0, absolute = True):
     else:
         return None
 
-def _select_hard_prompts(batch: DataProto, rollout_n: int, eps: float = 1e-6):
+def _select_easy_prompts(batch: DataProto, rollout_n: int, eps: float = 1e-6):
+    advantages = batch.batch["advantages"][:, 0]
+    values = batch.batch["token_level_scores"].sum(dim = 1)
+    selected_mask = (advantages.abs() < eps) & (values > eps)
+    selected_indices = selected_mask.nonzero(as_tuple=False).squeeze(-1)
+    #n1 = len(selected_indices)
+    #selected_indices = [i.item() // rollout_n for i in selected_indices if i.item() % rollout_n == 0]
+    #n2 = len(selected_indices)
+    #print(f"select easy prompts:", len(selected_indices))
+    #assert n1 == n2 * rollout_n
+    return selected_indices
+
+def set_easy_advantages(batch: DataProto, easy_indices: List[int], adv: int):
+    advantages = batch.batch["advantages"]  # shape: [B, T]
+    for idx in easy_indices:
+        advantages[idx] = adv
+
+def _select_hard_prompts(batch: DataProto, rollout_n: int, difficult_record, eps: float = 1e-6):
     advantages = batch.batch["advantages"][:, 0]
     values = batch.batch["token_level_scores"].sum(dim = 1)    
-    selected_mask = (advantages.abs() < eps) & (values.abs() < eps)
+    selected_mask = (advantages.abs() < eps) & (values < eps)
     selected_indices = selected_mask.nonzero(as_tuple=False).squeeze(-1)
     n1 = len(selected_indices)
     selected_indices = [i.item() // rollout_n for i in selected_indices if i.item() % rollout_n == 0]
     n2 = len(selected_indices)
+    difficult_record.append(len(selected_indices))
     print(f"select hard prompts:", len(selected_indices))
     assert n1 == n2 * rollout_n
     return selected_indices
 
 
-def _filtering_overlong(batch: DataProto):
+def _filtering_overlong(batch: DataProto, overlong_record, overlong_positive_record):
     advantages = batch.batch["advantages"][:, 0]
     response_mask_last_col = batch.batch["response_mask"][:, -1]
     selected_mask = ~((response_mask_last_col == 1) & (advantages > 0))
-    selected_indices = selected_mask.nonzero(as_tuple=False).squeeze(-1)
-    print("filtering overlong sample nums:", len(batch) - len(selected_indices))
-    if len(selected_indices) > 0:
-        return batch.select_by_index(index_list=selected_indices.tolist())
+    selected_mask = selected_mask.nonzero(as_tuple=False).squeeze(-1)
+    overlong_positive_record.append(len(batch) - len(selected_mask))
+
+    selected_overlong = (response_mask_last_col == 0)
+    selected_overlong = selected_overlong.nonzero(as_tuple=False).squeeze(-1)
+    overlong_record.append(len(batch) - len(selected_overlong))
+
+    if len(selected_mask) > 0:
+        return batch.select_by_index(index_list=selected_mask.tolist())
     else:
         return None  
 
@@ -676,7 +699,9 @@ class RayPPOTrainer:
         self.global_step = 0
         replay_buffer = Buffer(capacity=0)
         batch_buffer = Buffer(capacity=0)
-        rollout_buffer = Buffer(capacity=0)
+        difficult_record = []
+        overlong_record = []
+        overlong_positive_record = []
         val_metrics: Optional[Dict[str, Any]] = None
 
         # load checkpoint before doing anything
@@ -726,24 +751,26 @@ class RayPPOTrainer:
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
                     self._compute_values(batch, timing_raw)
                     self._compute_adv(batch, timing_raw)
-
+                    
+                    
                     if replay_buffer.capacity == 0:
                         replay_buffer.capacity = 2 * initial_batch_size
                     if batch_buffer.capacity == 0:
                         batch_buffer.capacity = 2 * initial_batch_size
-                    if rollout_buffer.capacity == 0:
-                        rollout_buffer.capacity = 2 * initial_batch_size
+                    
+                    # select prompts
                     count_occurrences(batch,"advantages")
-                    medium_advantage_batch = _select_by_advantage(batch, threshold = 0.1)
-                    # select difficult prompts
-                    difficult_prompt_indices = _select_hard_prompts(batch, self.config.worker.rollout.n)
+                    difficult_prompt_indices = _select_hard_prompts(batch, self.config.worker.rollout.n, difficult_record, 0.01)
+                    medium_advantage_batch = _select_by_advantage(batch, threshold = 0.05)
                     gen_difficult_batch = gen_batch.select_by_index(difficult_prompt_indices)
 
 
                     if len(gen_difficult_batch) % 32 > 0:
                         gen_difficult_batch = duplicate_gen_batch(gen_difficult_batch, 32)
-                    rollout_n = max(4 * self.config.worker.rollout.n - max(self.global_step - 100, 0) // 10, 10)
-                    temperature = max(1, 1.2 - max(self.global_step - 100, 0) / 500)
+                    rollout_n = 20
+                    temperature = 1.2
+                    #rollout_n = max(4 * self.config.worker.rollout.n - max(self.global_step - 100, 0) // 10, 10)
+                    #temperature = max(1, 1.2 - max(self.global_step - 100, 0) / 500)
                     gen_difficult_batch.meta_info["temperature"] = temperature
                     gen_difficult_batch.meta_info["n"] = rollout_n
                     
@@ -764,16 +791,18 @@ class RayPPOTrainer:
                     self._compute_adv(difficult_batch, timing_raw)
                     count_occurrences(difficult_batch, "advantages")
                     difficult_batch = _select_by_advantage(difficult_batch, threshold = 1)
-                    print("difficult_batch:", len(difficult_batch))
-                    
 
                     # union final batch
                     batch = DataProto.concat([difficult_batch, medium_advantage_batch])
-                    batch = _filtering_overlong(batch)
+                    #_filtering_overlong(batch, overlong_record, overlong_positive_record)
+                    batch = _filtering_overlong(batch, overlong_record, overlong_positive_record)
 
+                    print("difficult prompt nums:", difficult_record)
+                    print("overlong_nums:", overlong_record)
+                    print("overlong_positive:", overlong_positive_record)
                     batch_buffer.add(batch)
                     if batch_buffer.size >= initial_batch_size:
-                        batch = batch_buffer.pop(initial_batch_size)
+                        batch = batch_buffer.pop((batch_buffer.size // initial_batch_size) * initial_batch_size)
                         self._compute_old_log_probs(batch, timing_raw)
                         self._compute_ref_log_probs(batch, timing_raw)
                         high_advantage_batch = _select_by_advantage(batch, threshold = 1)
@@ -794,6 +823,17 @@ class RayPPOTrainer:
                         self._update_critic(replay_batch, timing_raw, metrics)
                         self._update_actor(replay_batch, timing_raw, metrics)
                         print("end replay buffer")
+                    '''
+                    _select_hard_prompts(batch, self.config.worker.rollout.n, difficult_record, 0.01)
+                    _filtering_overlong(batch, overlong_record, overlong_positive_record)
+                    print("difficult prompt nums:", difficult_record)
+                    print("overlong_nums:", overlong_record)
+                    print("overlong_positive:", overlong_positive_record)
+                    self._compute_old_log_probs(batch, timing_raw)
+                    self._compute_ref_log_probs(batch, timing_raw)
+                    self._update_critic(batch, timing_raw, metrics)
+                    self._update_actor(batch, timing_raw, metrics)
+                    '''
 
                     # validate
                     if (

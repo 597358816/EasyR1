@@ -356,27 +356,29 @@ def compute_policy_loss(
     pg_clipfrac_lower = (clipped_pg_loss_higher > pg_loss3).float() * (advantages < 0).float()
     
     # version of dr.grpo
-    #final_pg_loss = torch.mean(torch.sum(final_pg_loss * response_mask, dim=-1))/300
-    #pg_clipfrac_higher = VF.masked_mean(pg_clipfrac_higher, response_mask)
-    #pg_clipfrac_lower = VF.masked_mean(pg_clipfrac_lower, response_mask)
-    #ppo_kl = VF.masked_mean(-negative_approx_kl, response_mask)
+    '''
+    final_pg_loss = torch.mean(torch.sum(final_pg_loss * response_mask, dim=-1))/400
+    pg_clipfrac_higher = VF.masked_mean(pg_clipfrac_higher, response_mask)
+    pg_clipfrac_lower = VF.masked_mean(pg_clipfrac_lower, response_mask)
+    ppo_kl = VF.masked_mean(-negative_approx_kl, response_mask)
     #print("this is dr.grpo")
-
-
+    '''
+    '''
     # version of GRPO
-    #final_pg_loss = torch.mean(torch.mean(final_pg_loss * response_mask, dim=-1))
-    #pg_clipfrac_higher = VF.masked_mean(pg_clipfrac_higher, response_mask)
-    #pg_clipfrac_lower = VF.masked_mean(pg_clipfrac_lower, response_mask)
-    #ppo_kl = VF.masked_mean(-negative_approx_kl, response_mask)
-    #print("this is GRPO")
-
+    final_pg_loss = torch.mean(torch.mean(final_pg_loss * response_mask, dim=-1))
+    pg_clipfrac_higher = VF.masked_mean(pg_clipfrac_higher, response_mask)
+    pg_clipfrac_lower = VF.masked_mean(pg_clipfrac_lower, response_mask)
+    ppo_kl = VF.masked_mean(-negative_approx_kl, response_mask)
+    print("this is GRPO")
+    '''
+    
     # version of dapo
     final_pg_loss = VF.masked_mean(final_pg_loss, response_mask)
     pg_clipfrac_higher = VF.masked_mean(pg_clipfrac_higher, response_mask)
     pg_clipfrac_lower = VF.masked_mean(pg_clipfrac_lower, response_mask)
     ppo_kl = VF.masked_mean(-negative_approx_kl, response_mask)
-    print("this is dapo")
-
+    #print("this is dapo")
+    
     return final_pg_loss, pg_clipfrac_higher, pg_clipfrac_lower, ppo_kl
 
 def masked_sum(values: torch.Tensor, mask: torch.Tensor, dim: int = None) -> torch.Tensor:

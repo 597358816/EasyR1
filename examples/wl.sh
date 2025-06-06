@@ -2,8 +2,7 @@ set -x
 
 MODEL_PATH=/home/dataset-assist-0/wc/models/Qwen/Qwen2.5-VL-7B-Instruct  # replace it with your local file path
 
-FORMAT_PROMPT="""You FIRST think about the reasoning process as an internal monologue and then provide the final answer.
- The reasoning process MUST BE enclosed within <think> </think> tags. The final answer MUST BE put in \boxed{}."""
+FORMAT_PROMPT=""" Please reason step by step, then put your final answer within \boxed{}."""
 
 python3 -m verl.trainer.main \
     config=wl_config.yaml \
@@ -11,5 +10,5 @@ python3 -m verl.trainer.main \
     data.val_files=hiyouga/geometry3k@test \
     data.format_prompt="${FORMAT_PROMPT}" \
     worker.actor.model.model_path=${MODEL_PATH} \
-    trainer.experiment_name=annealing-clip0.2-wl \
+    trainer.experiment_name=RFR-wl \
     trainer.n_gpus_per_node=8 \

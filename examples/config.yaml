@@ -73,13 +73,13 @@ worker:
 
 trainer:
   total_episodes: 300
-  logger: ["console", "wandb"]
-  project_name: Rollout
+  logger: ["console","wandb"]
+  project_name: Paper
   experiment_name: qwen2_5_3b_origin
   n_gpus_per_node: 8
   nnodes: 1
   val_freq: 5  # -1 to disable
-  val_before_train: false
+  val_before_train: true
   val_only: false
   val_generations_to_log: 3
   save_freq: 5  # -1 to disable
