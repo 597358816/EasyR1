@@ -175,6 +175,26 @@ def _select_by_advantage(batch: DataProto, threshold = 0, absolute = True):
         return batch.select_by_index(index_list=selected_indices.tolist())
     else:
         return None
+def _compute_bool_reward_by_advantage(batch: DataProto, threshold = 0, absolute = True):
+    # 原advantage如果大于threshold，则标记为True，否则为False。直接重建一个和advantage同shape的bool tensor放到batch中
+    advantages = batch.batch["advantages"][:,0]
+    if absolute:
+        selected_mask = advantages.abs() > threshold
+    else:
+        selected_mask = advantages > threshold
+    bool_tensor = selected_mask.to(torch.bool)
+    batch.batch["bool_reward"] = bool_tensor
+    return batch
+def _compute_bool_reward_by_score(batch: DataProto, threshold = 0, absolute = True):
+    # 原advantage如果大于threshold，则标记为True，否则为False。直接重建一个和advantage同shape的bool tensor放到batch中
+    values = batch.batch["token_level_scores"].sum(dim = 1)
+    if absolute:
+        selected_mask = values.abs() > threshold
+    else:
+        selected_mask = values > threshold
+    bool_tensor = selected_mask.to(torch.bool)
+    batch.batch["bool_reward"] = bool_tensor
+    return batch
 
 def _select_easy_prompts(batch: DataProto, rollout_n: int, eps: float = 1e-6):
     advantages = batch.batch["advantages"][:, 0]
@@ -651,10 +671,20 @@ class RayPPOTrainer:
             }
             metrics.update(reward_metrics)
 
-    def _compute_old_log_probs(self, batch: DataProto, timing_raw):
-        with _timer("old", timing_raw):
-            old_log_probs = self.actor_rollout_wg.compute_log_probs(batch)
-            batch = batch.union(old_log_probs)
+    def _compute_old_log_probs(self, batch: DataProto, timing_raw, temperature = None):
+        if temperature is None:
+            with _timer("old", timing_raw):
+                batch.meta_info["temperature"] = 1.0
+                old_log_probs = self.actor_rollout_wg.compute_log_probs(batch)
+                batch = batch.union(old_log_probs)
+        else:
+            with _timer(f"old-t{temperature}", timing_raw):
+                batch_t = deepcopy(batch)
+                batch_t.meta_info["temperature"] = temperature
+                old_log_probs = self.actor_rollout_wg.compute_log_probs(batch_t)
+                batch.batch["old_log_probs_t"] = old_log_probs.batch["old_log_probs"]
+
+
 
     def _compute_ref_log_probs(self, batch: DataProto, timing_raw):
         if self.use_reference_policy:
@@ -702,6 +732,8 @@ class RayPPOTrainer:
         difficult_record = []
         overlong_record = []
         overlong_positive_record = []
+        entropy = 0
+        entropy_base = 0.5
         val_metrics: Optional[Dict[str, Any]] = None
 
         # load checkpoint before doing anything
@@ -735,6 +767,7 @@ class RayPPOTrainer:
                         batch_keys=["input_ids", "attention_mask", "position_ids"],
                         non_tensor_batch_keys=["raw_prompt_ids"],
                     )
+                gen_batch_bak = deepcopy(gen_batch)
                 with _timer("step", timing_raw):
                     # generate a batch
                     with _timer("gen", timing_raw):  # wg: worker group
@@ -745,95 +778,222 @@ class RayPPOTrainer:
                         [str(uuid.uuid4()) for _ in range(len(initial_batch.batch))], dtype=object
                     )
                     batch = initial_batch.repeat(repeat_times=self.config.worker.rollout.n, interleave=True)
+                    batch_bak = deepcopy(batch)
                     batch = batch.union(gen_batch_output)
                     initial_batch_size = len(batch)
                     self._compute_reward(batch, timing_raw, metrics)
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
                     self._compute_values(batch, timing_raw)
                     self._compute_adv(batch, timing_raw)
-                    
-                    
+
                     if replay_buffer.capacity == 0:
-                        replay_buffer.capacity = 2 * initial_batch_size
+                        replay_buffer.capacity =  2 * initial_batch_size
                     if batch_buffer.capacity == 0:
-                        batch_buffer.capacity = 2 * initial_batch_size
+                        batch_buffer.capacity = 4 * initial_batch_size
                     
-                    # select prompts
-                    count_occurrences(batch,"advantages")
-                    difficult_prompt_indices = _select_hard_prompts(batch, self.config.worker.rollout.n, difficult_record, 0.01)
-                    medium_advantage_batch = _select_by_advantage(batch, threshold = 0.05)
-                    gen_difficult_batch = gen_batch.select_by_index(difficult_prompt_indices)
-
-
-                    if len(gen_difficult_batch) % 32 > 0:
-                        gen_difficult_batch = duplicate_gen_batch(gen_difficult_batch, 32)
-                    rollout_n = 20
-                    temperature = 1.2
-                    #rollout_n = max(4 * self.config.worker.rollout.n - max(self.global_step - 100, 0) // 10, 10)
-                    #temperature = max(1, 1.2 - max(self.global_step - 100, 0) / 500)
-                    gen_difficult_batch.meta_info["temperature"] = temperature
-                    gen_difficult_batch.meta_info["n"] = rollout_n
+                    alg = "entropy_importance_sampling"
+                    if alg=="EFRame":
                     
+                        # select prompts
+                        count_occurrences(batch,"advantages")
+                        difficult_prompt_indices = _select_hard_prompts(batch, self.config.worker.rollout.n, difficult_record, 0.01)
+                        medium_advantage_batch = _select_by_advantage(batch, threshold = 0.05)
+                        
+                        gen_difficult_batch = gen_batch.select_by_index(difficult_prompt_indices)
 
-                    # generate response for difficult prompts
-                    with _timer("gen", timing_raw):  # wg: worker group
-                        gen_difficult_batch_output = self.actor_rollout_wg.generate_sequences(gen_difficult_batch)
-                    
+                        
+                        if len(gen_difficult_batch) % 32 > 0:
+                            gen_difficult_batch = duplicate_gen_batch(gen_difficult_batch, 32)
 
-                    difficult_batch = initial_batch.select_by_index(difficult_prompt_indices)
-                    difficult_batch = duplicate_gen_batch(difficult_batch, 32)
-                    difficult_batch = difficult_batch.repeat(repeat_times = rollout_n, interleave=True)
-                    difficult_batch = difficult_batch.union(gen_difficult_batch_output)
+                        temperature = 1.2
+                        rollout_n = 20
+                        gen_difficult_batch.meta_info["temperature"] = temperature
+                        gen_difficult_batch.meta_info["n"] = rollout_n
+                        
+                        # generate response for difficult prompts
+                        with _timer("gen", timing_raw):  
+                            gen_difficult_batch_output = self.actor_rollout_wg.generate_sequences(gen_difficult_batch)
+                        
 
-                    self._compute_reward(difficult_batch, timing_raw, metrics)
-                    difficult_batch.meta_info["global_token_num"] = torch.sum(difficult_batch.batch["attention_mask"], dim=-1).tolist()
-                    self._compute_values(difficult_batch, timing_raw)
-                    self._compute_adv(difficult_batch, timing_raw)
-                    count_occurrences(difficult_batch, "advantages")
-                    difficult_batch = _select_by_advantage(difficult_batch, threshold = 1)
+                        difficult_batch = initial_batch.select_by_index(difficult_prompt_indices)
+                        difficult_batch = duplicate_gen_batch(difficult_batch, 32)
+                        difficult_batch = difficult_batch.repeat(repeat_times = rollout_n, interleave=True)
+                        difficult_batch = difficult_batch.union(gen_difficult_batch_output)
 
-                    # union final batch
-                    batch = DataProto.concat([difficult_batch, medium_advantage_batch])
-                    #_filtering_overlong(batch, overlong_record, overlong_positive_record)
-                    batch = _filtering_overlong(batch, overlong_record, overlong_positive_record)
+                        self._compute_reward(difficult_batch, timing_raw, metrics)
+                        difficult_batch.meta_info["global_token_num"] = torch.sum(difficult_batch.batch["attention_mask"], dim=-1).tolist()
+                        self._compute_values(difficult_batch, timing_raw)
+                        self._compute_adv(difficult_batch, timing_raw)
+                        count_occurrences(difficult_batch, "advantages")
+                        difficult_batch = _select_by_advantage(difficult_batch, threshold = 1)
+                        
+                        # union final batch
+                        batch = DataProto.concat([difficult_batch, medium_advantage_batch])
+                        
+                        #_filtering_overlong(batch, overlong_record, overlong_positive_record)
+                        batch = _filtering_overlong(batch, overlong_record, overlong_positive_record)
 
-                    print("difficult prompt nums:", difficult_record)
-                    print("overlong_nums:", overlong_record)
-                    print("overlong_positive:", overlong_positive_record)
-                    batch_buffer.add(batch)
-                    if batch_buffer.size >= initial_batch_size:
-                        batch = batch_buffer.pop((batch_buffer.size // initial_batch_size) * initial_batch_size)
+                        print("difficult prompt nums:", difficult_record)
+                        print("overlong_nums:", overlong_record)
+                        print("overlong_positive:", overlong_positive_record)
+                        batch_buffer.add(batch)
+                        if batch_buffer.size >= initial_batch_size:
+                            batch = batch_buffer.pop((batch_buffer.size // initial_batch_size) * initial_batch_size)
+                            self._balance_batch(batch, metrics)
+                            self._compute_old_log_probs(batch, timing_raw)
+                            self._compute_ref_log_probs(batch, timing_raw)
+                            high_advantage_batch = _select_by_advantage(batch, threshold = 1)
+                        
+                            print("final batch size is:", len(batch))
+                            self._update_critic(batch, timing_raw, metrics)
+                            self._update_actor(batch, timing_raw, metrics)
+                            replay_buffer.add(high_advantage_batch)
+                            print("replay_buffer size:", replay_buffer.size)
+                        
+                        # train using replay buffer
+                        if (self.global_step % 5 == 0 and replay_buffer.size // initial_batch_size > 0):
+                            print("start replay buffer")
+                            if replay_buffer.size == replay_buffer.capacity:
+                                replay_batch = replay_buffer.buffer
+                            else:
+                                replay_batch = replay_buffer.sample((replay_buffer.size // initial_batch_size)* initial_batch_size)
+                            self._update_critic(replay_batch, timing_raw, metrics)
+                            self._update_actor(replay_batch, timing_raw, metrics)
+                            print("end replay buffer")  
+
+                    elif alg=="entropy":
+                        temperature = 1
+                        if entropy <= entropy_base:
+                            temperature = 1.2
+                        elif entropy > entropy_base:  
+                            temperature = 0.8     
+                        gen_batch_bak.meta_info["temperature"] = temperature
+                        gen_batch_bak.meta_info["n"] = 5   
+                        
+                        with _timer("gen", timing_raw):  
+                            gen_batch_output_bak = self.actor_rollout_wg.generate_sequences(gen_batch_bak)
+                        batch_bak = batch_bak.union(gen_batch_output_bak)    
+                        self._compute_reward(batch_bak, timing_raw, metrics)
+                        batch_bak.meta_info["global_token_num"] = torch.sum(batch_bak.batch["attention_mask"], dim=-1).tolist()
+                        self._compute_values(batch_bak, timing_raw)
+                        self._compute_adv(batch_bak, timing_raw)
+                        
+                        # entropy_controller = _select_by_advantage(batch_bak, threshold = 0.05, absolute=True)
+
+                        
+                        entropy_controller = _select_by_advantage(batch_bak, threshold = 0.05, absolute=False)
+                        entropy_controller.batch["advantages"] = torch.ones_like(entropy_controller.batch["advantages"])
+                        if entropy <= entropy_base:
+                            sample_num = min(120, len(entropy_controller))
+                        elif entropy > entropy_base:     
+                            sample_num = min(80, len(entropy_controller))    
+                        entropy_batch = DataProto.concat([entropy_controller[:sample_num], batch[sample_num:]])
+
+                        self._compute_old_log_probs(entropy_batch, timing_raw)
+                        # self._compute_old_log_probs(entropy_batch, timing_raw, temperature = temperature)
+                        # old_log_probs = entropy_batch.batch['old_log_probs']
+                        # old_log_probs_t = entropy_batch.batch['old_log_probs_t']
+                        
+                        #entropy_batch.batch["advantages"][:sample_num] = entropy_batch.batch["advantages"][:sample_num] * torch.exp(old_log_probs[:sample_num] - old_log_probs_t[:sample_num])
+                        #entropy_batch.batch['old_log_probs'][:sample_num] = old_log_probs_t[:sample_num]
+                        self._compute_ref_log_probs(entropy_batch, timing_raw)
+            
+                        self._update_critic(entropy_batch, timing_raw, metrics)
+                        self._update_actor(entropy_batch, timing_raw, metrics) 
+                        
+                    elif alg=="entropy_importance_sampling":  
+                        # batch = _select_by_advantage(batch, threshold = 0.05)
+                        # batch_buffer.add(batch)
+                        # if batch_buffer.size >= initial_batch_size:
+                        #     batch = batch_buffer.pop((batch_buffer.size // initial_batch_size) * initial_batch_size)
+                        temperature = 1          
+                        if entropy <= entropy_base:
+                            temperature = 1.2
+                        elif entropy > entropy_base:     
+                            temperature = 0.8        
+                        _compute_bool_reward_by_score(batch, threshold = 0.05, absolute=False)
                         self._compute_old_log_probs(batch, timing_raw)
+                        self._compute_old_log_probs(batch, timing_raw, temperature = temperature)
+                        
+                        old_log_probs = batch.batch['old_log_probs']
+                        old_log_probs_t = batch.batch['old_log_probs_t']
+                        entropy_factor =  torch.exp(old_log_probs_t - old_log_probs)
+                        true_ratio = (batch.batch["bool_reward"]==1).sum() / len(batch)
+                        # print(entropy_factor[0].tolist())
+                        # print(batch.batch['old_log_probs'][0].tolist())
+                        # print(batch.batch["bool_reward"].tolist())
+                        # print("entropy_factor.shape:", entropy_factor.shape)
+                        # print("batch.batch['bool_reward'].shape:", batch.batch['bool_reward'].shape)
+                        alpha = 0.15
+                        batch.batch["advantages"] += alpha/true_ratio  * batch.batch["bool_reward"].to(batch.batch["advantages"].dtype).unsqueeze(1) * entropy_factor
+                        #batch.batch["advantages"] = batch.batch["advantages"] + alpha * batch.batch["bool_reward"].to(batch.batch["advantages"].dtype).unsqueeze(1) * entropy_factor
                         self._compute_ref_log_probs(batch, timing_raw)
-                        high_advantage_batch = _select_by_advantage(batch, threshold = 1)
-                    
-                        print("final batch size is:", len(batch))
                         self._update_critic(batch, timing_raw, metrics)
                         self._update_actor(batch, timing_raw, metrics)
-                        replay_buffer.add(high_advantage_batch)
-                        print("replay_buffer size:", replay_buffer.size)
-                    
-                    # train using replay buffer
-                    if (self.global_step % 5 == 0 and replay_buffer.size // initial_batch_size > 0):
-                        print("start replay buffer")
-                        if replay_buffer.size == replay_buffer.capacity:
-                            replay_batch = replay_buffer.buffer
-                        else:
-                            replay_batch = replay_buffer.sample((replay_buffer.size // initial_batch_size)* initial_batch_size)
-                        self._update_critic(replay_batch, timing_raw, metrics)
-                        self._update_actor(replay_batch, timing_raw, metrics)
-                        print("end replay buffer")
-                    '''
-                    _select_hard_prompts(batch, self.config.worker.rollout.n, difficult_record, 0.01)
-                    _filtering_overlong(batch, overlong_record, overlong_positive_record)
-                    print("difficult prompt nums:", difficult_record)
-                    print("overlong_nums:", overlong_record)
-                    print("overlong_positive:", overlong_positive_record)
-                    self._compute_old_log_probs(batch, timing_raw)
-                    self._compute_ref_log_probs(batch, timing_raw)
-                    self._update_critic(batch, timing_raw, metrics)
-                    self._update_actor(batch, timing_raw, metrics)
-                    '''
+                        
+                    elif alg=="entropy_importance_sampling_reverse":  
+                        temperature = 1          
+                        if entropy <= entropy_base:
+                            temperature = 0.8
+                        elif entropy > entropy_base:     
+                            temperature = 1.2   
+                        _compute_bool_reward_by_advantage(batch, threshold = 0.05, absolute=False)
+                        self._compute_old_log_probs(batch, timing_raw)
+                        self._compute_old_log_probs(batch, timing_raw, temperature = temperature)
+                        alpha = 0.1
+                        old_log_probs = batch.batch['old_log_probs']
+                        old_log_probs_t = batch.batch['old_log_probs_t']
+                        entropy_factor =  torch.exp(old_log_probs - old_log_probs_t)
+                        # print(entropy_factor[0].tolist())
+                        # print(batch.batch['old_log_probs'][0].tolist())
+                        # print(batch.batch["bool_reward"].tolist())
+                        # print("entropy_factor.shape:", entropy_factor.shape)
+                        # print("batch.batch['bool_reward'].shape:", batch.batch['bool_reward'].shape)
+                        true_ratio = (batch.batch["bool_reward"]==1).sum() / len(batch)
+                        batch.batch["advantages"] += alpha/true_ratio * batch.batch["bool_reward"].to(batch.batch["advantages"].dtype).unsqueeze(1) * entropy_factor
+                        self._compute_ref_log_probs(batch, timing_raw)
+                        self._update_critic(batch, timing_raw, metrics)
+                        self._update_actor(batch, timing_raw, metrics)
+                    elif alg=="grpo":                   
+                        self._compute_old_log_probs(batch, timing_raw)
+                        self._compute_ref_log_probs(batch, timing_raw)
+                        self._update_critic(batch, timing_raw, metrics)
+                        self._update_actor(batch, timing_raw, metrics)
+                    elif alg=="entropy_adv":                   
+                        alpha = 0.4
+                        kappa = 2
+                        token_entropy = self.actor_rollout_wg.compute_entropy(batch).batch["entropy"]
+                        batch.batch["advantages"] += torch.min(alpha * token_entropy.detach(), batch.batch["advantages"].abs()/kappa)
+                        self._compute_old_log_probs(batch, timing_raw)
+                        self._compute_ref_log_probs(batch, timing_raw)
+                        self._update_critic(batch, timing_raw, metrics)
+                        self._update_actor(batch, timing_raw, metrics)
+                    elif alg=="entropy_reward_regularization":                   
+
+                        self._compute_old_log_probs(batch, timing_raw)
+                        self._compute_ref_log_probs(batch, timing_raw)
+                        self._update_critic(batch, timing_raw, metrics)
+                        self._update_actor(batch, timing_raw, metrics)
+                        
+                        
+                    elif alg=="dapo":           
+                        batch = _select_by_advantage(batch, threshold = 0.05)
+                        batch_buffer.add(batch)
+
+                        if batch_buffer.size >= initial_batch_size:
+                            batch = batch_buffer.pop((batch_buffer.size // initial_batch_size) * initial_batch_size)
+                            self._compute_old_log_probs(batch, timing_raw)
+                            self._compute_ref_log_probs(batch, timing_raw)
+                            high_advantage_batch = _select_by_advantage(batch, threshold = 1)
+
+                            print("final batch size is:", len(batch))
+                            self._update_critic(batch, timing_raw, metrics)
+                            self._update_actor(batch, timing_raw, metrics)
+                            replay_buffer.add(high_advantage_batch)
+
+
+                    if "actor/entropy_loss" in metrics:
+                        entropy = metrics["actor/entropy_loss"]    
 
                     # validate
                     if (
@@ -855,7 +1015,6 @@ class RayPPOTrainer:
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, num_gpus=num_gpus))
-
                 self.logger.log(data=metrics, step=self.global_step)
 
         # perform validation after training

@@ -513,13 +513,17 @@ class FSDPWorker(Worker):
             load_fsdp_model(self.fsdp_module)
 
         # we should always recompute old_log_probs when it is HybridEngine
-        data.meta_info["temperature"] = self.config.rollout.temperature
+        if "temperature" in data.meta_info:
+            temperature = data.meta_info["temperature"]
+        else:
+            temperature = self.config.rollout.temperature
+        data.meta_info["temperature"] = temperature
         # perform recompute log_prob
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
             output = self.actor.compute_log_prob(data=data)
             output = DataProto.from_dict(
-                tensors={"old_log_probs": output}, meta_info={"temperature": self.config.rollout.temperature}
+                tensors={"old_log_probs": output}, meta_info={"temperature": temperature}
             )
             output = self.ulysses_sharding_manager.postprocess_data(output)
 
@@ -534,6 +538,34 @@ class FSDPWorker(Worker):
         output = output.to("cpu")
         return output
 
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def compute_entropy(self, data: DataProto):
+        assert self._is_actor
+        data = data.to(torch.cuda.current_device())
+        if self._use_param_offload:
+            load_fsdp_model(self.fsdp_module)
+
+        # we should always recompute old_log_probs when it is HybridEngine
+        data.meta_info["temperature"] = self.config.rollout.temperature
+        # perform recompute log_prob
+        with self.ulysses_sharding_manager:
+            data = self.ulysses_sharding_manager.preprocess_data(data)
+            output = self.actor.compute_entropy(data=data)
+            output = DataProto.from_dict(
+                tensors={"entropy": output}, meta_info={"temperature": self.config.rollout.temperature}
+            )
+            output = self.ulysses_sharding_manager.postprocess_data(output)
+
+        # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
+        # unshard the root FSDP module
+        if self.world_size > 1:
+            self.fsdp_module._handle.reshard(True)
+
+        if self._use_param_offload:
+            offload_fsdp_model(self.fsdp_module)
+
+        output = output.to("cpu")
+        return output
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_ref_log_probs(self, data: DataProto):
         assert self._is_ref

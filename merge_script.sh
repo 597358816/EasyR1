@@ -1,20 +1,7 @@
-python3 scripts/model_merger.py --local_dir examples/checkpoints/Rollout/RFR-wl/global_step_205/actor/
-python3 scripts/model_merger.py --local_dir examples/checkpoints/Rollout/RFR-wl/global_step_110/actor/
-python3 scripts/model_merger.py --local_dir examples/checkpoints/Rollout/RFR-wl/global_step_115/actor/
-python3 scripts/model_merger.py --local_dir examples/checkpoints/Rollout/RFR-wl/global_step_120/actor/
-python3 scripts/model_merger.py --local_dir examples/checkpoints/Rollout/RFR-wl/global_step_125/actor/
-python3 scripts/model_merger.py --local_dir examples/checkpoints/Rollout/RFR-wl/global_step_130/actor/
-python3 scripts/model_merger.py --local_dir examples/checkpoints/Rollout/RFR-wl/global_step_135/actor/
-python3 scripts/model_merger.py --local_dir examples/checkpoints/Rollout/RFR-wl/global_step_140/actor/
-python3 scripts/model_merger.py --local_dir examples/checkpoints/Rollout/RFR-wl/global_step_145/actor/
-python3 scripts/model_merger.py --local_dir examples/checkpoints/Rollout/RFR-wl/global_step_150/actor/
-python3 scripts/model_merger.py --local_dir examples/checkpoints/Rollout/RFR-wl/global_step_155/actor/
-python3 scripts/model_merger.py --local_dir examples/checkpoints/Rollout/RFR-wl/global_step_160/actor/
-python3 scripts/model_merger.py --local_dir examples/checkpoints/Rollout/RFR-wl/global_step_165/actor/
-python3 scripts/model_merger.py --local_dir examples/checkpoints/Rollout/RFR-wl/global_step_170/actor/
-python3 scripts/model_merger.py --local_dir examples/checkpoints/Rollout/RFR-wl/global_step_175/actor/
-python3 scripts/model_merger.py --local_dir examples/checkpoints/Rollout/RFR-wl/global_step_180/actor/
-python3 scripts/model_merger.py --local_dir examples/checkpoints/Rollout/RFR-wl/global_step_185/actor/
-python3 scripts/model_merger.py --local_dir examples/checkpoints/Rollout/RFR-wl/global_step_190/actor/
-python3 scripts/model_merger.py --local_dir examples/checkpoints/Rollout/RFR-wl/global_step_195/actor/
-python3 scripts/model_merger.py --local_dir examples/checkpoints/Rollout/RFR-wl/global_step_200/actor/
+for step in $(seq 110 10 300)
+do
+    echo ${step}
+    python3 scripts/model_merger.py --local_dir  /home/dataset-assist-0/wc/EasyR1-main/examples/checkpoints/Entropy-Controller/IS-e0.5-a0.15-noratio/global_step_${step}/actor/
+done
+
+

@@ -90,12 +90,15 @@ class ActorConfig:
     optim: OptimConfig = field(default_factory=OptimConfig)
     fsdp: FSDPConfig = field(default_factory=FSDPConfig)
     offload: OffloadConfig = field(default_factory=OffloadConfig)
+    entropy_from_logits_with_chunking: bool = field(default=False, init=False)
     """auto keys"""
     global_batch_size_per_device: int = field(default=-1, init=False)
     disable_kl: bool = field(default=False, init=False)
     use_kl_loss: bool = field(default=False, init=False)
     kl_penalty: str = field(default="kl", init=False)
     kl_coef: float = field(default=0.0, init=False)
+    use_entropy_loss: bool = field(default=False, init=False)
+    entropy_coef: float = field(default=0.03, init=False)
 
 
 @dataclass

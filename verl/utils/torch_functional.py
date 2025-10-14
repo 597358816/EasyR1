@@ -64,7 +64,22 @@ def log_probs_from_logits(logits: torch.Tensor, labels: torch.Tensor) -> torch.T
         output = F.cross_entropy(logits.float(), labels, reduction="none")
 
     return output.view(*batch_dim)
+def entropy_from_logits(logits: torch.Tensor):
+    """Calculate entropy from logits."""
+    pd = torch.nn.functional.softmax(logits, dim=-1)
+    entropy = torch.logsumexp(logits, dim=-1) - torch.sum(pd * logits, dim=-1)
+    return entropy
 
+
+def entropy_from_logits_with_chunking(logits: torch.Tensor, chunk_size: int = 2048):
+    """Memory-efficient entropy calculation with chunking."""
+    entropy = torch.zeros(logits.shape[0], device=logits.device)
+    for i in range(0, logits.shape[0], chunk_size):
+        logits_chunk = logits[i : i + chunk_size].float()
+        pd_chunk = torch.nn.functional.softmax(logits_chunk, dim=-1)
+        entropy_chunk = torch.logsumexp(logits_chunk, dim=-1) - torch.sum(pd_chunk * logits_chunk, dim=-1)
+        entropy[i : i + chunk_size] = entropy_chunk
+    return entropy
 
 def masked_mean(values: torch.Tensor, mask: torch.Tensor, dim: int = None, eps: float = 1e-8) -> torch.Tensor:
     """Compute mean of tensor with a masked values."""
