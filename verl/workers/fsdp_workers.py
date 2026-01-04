@@ -566,6 +566,40 @@ class FSDPWorker(Worker):
 
         output = output.to("cpu")
         return output
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def compute_logits(self, data: DataProto):
+        assert self._is_actor
+        data = data.to(torch.cuda.current_device())
+        if self._use_param_offload:
+            load_fsdp_model(self.fsdp_module)
+
+        # Set temperature: prefer meta_info, fallback to config
+        if "temperature" in data.meta_info:
+            temperature = data.meta_info["temperature"]
+        else:
+            temperature = self.config.rollout.temperature
+        data.meta_info["temperature"] = temperature
+
+        # Compute logits
+        with self.ulysses_sharding_manager:
+            data = self.ulysses_sharding_manager.preprocess_data(data)
+            output = self.actor.compute_logits(data=data)
+            output = DataProto.from_dict(
+                tensors={"logits": output},
+                meta_info={"temperature": temperature}
+            )
+            output = self.ulysses_sharding_manager.postprocess_data(output)
+
+        # Per FSDP best practice: unshard root module after forward (see FSDP Notes)
+        if self.world_size > 1:
+            self.fsdp_module._handle.reshard(True)
+
+        if self._use_param_offload:
+            offload_fsdp_model(self.fsdp_module)
+
+        output = output.to("cpu")
+        return output
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_ref_log_probs(self, data: DataProto):
         assert self._is_ref

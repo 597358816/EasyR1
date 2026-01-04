@@ -18,7 +18,7 @@ algorithm:
   disable_kl: true
   use_kl_loss: true
   kl_penalty: low_var_kl
-  kl_coef: 1.0e-2
+  kl_coef: 0
 
 worker:
   actor:
@@ -72,9 +72,9 @@ worker:
     score_function: /home/dataset-assist-0/wc/EasyR1-main/examples/score_function/math.py:math_compute_score
 
 trainer:
-  total_episodes: 3
+  total_episodes: 10
   logger: ["console","wandb"]
-  project_name: Entropy-Controller
+  project_name: easyr1
   experiment_name: name
   n_gpus_per_node: 8
   nnodes: 1

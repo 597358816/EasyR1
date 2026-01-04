@@ -11,13 +11,14 @@ python3 -m verl.trainer.main \
     data.val_files=hiyouga/math12k@test \
     data.format_prompt="${FORMAT_PROMPT}" \
     worker.actor.model.model_path=${MODEL_PATH} \
-    trainer.experiment_name=math-AEPO2-1 \
+    trainer.project_name=EFRame@k \
+    trainer.experiment_name=DAPO \
     trainer.n_gpus_per_node=8 \
-    #trainer.load_checkpoint_path=/home/dataset-assist-0/wc/EasyR1-main/examples/checkpoints/easyr1/math-AEPO2-1/global_step_220 \
-    #worker.actor.use_entropy_loss=true 
+    trainer.total_episodes=6 \
+    trainer.save_limit=10 \
 
 
 
     #trainer.save_freq=-1
-    #trainer.load_checkpoint_path=/home/dataset-assist-0/wc/EasyR1-main/examples/checkpoints//home/dataset-assist-0/wc/EasyR1-main/examples/checkpoints/easyr1/math-ab-reinforce/global_step_160 \
+    #trainer.load_checkpoint_path=/home/dataset-assist-0/wc/EasyR1-main/examples/checkpoints/Entropy-Controller/IS-e0.5-a0.1-ratio-noclipdual/global_step_110 \
     #trainer.save_freq=-1 

@@ -80,7 +80,7 @@ class ActorConfig:
     micro_batch_size_per_device_for_experience: int = 16
     max_grad_norm: float = 1.0
     clip_ratio_low: float = 0.2
-    clip_ratio_high: float = 0.3
+    clip_ratio_high: float = 0.2
     clip_ratio_dual: float = 3.0
     ppo_epochs: int = 1
     padding_free: bool = False
@@ -98,7 +98,7 @@ class ActorConfig:
     kl_penalty: str = field(default="kl", init=False)
     kl_coef: float = field(default=0.0, init=False)
     use_entropy_loss: bool = field(default=False, init=False)
-    entropy_coef: float = field(default=0.03, init=False)
+    entropy_coef: float = field(default=0.015, init=False)
 
 
 @dataclass
@@ -111,3 +111,4 @@ class RefConfig:
     padding_free: bool = field(default=False, init=False)
     ulysses_sequence_parallel_size: int = field(default=1, init=False)
     use_torch_compile: bool = field(default=True, init=False)
+    entropy_from_logits_with_chunking: bool = field(default=False, init=False)

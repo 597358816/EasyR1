@@ -70,7 +70,7 @@ class DataParallelPPOActor(BasePPOActor):
             else entropy_from_logits
         )
 
-    def _forward_micro_batch(self, micro_batch: Dict[str, torch.Tensor], temperature: float, calculate_entropy=False) -> torch.Tensor:
+    def _forward_micro_batch(self, micro_batch: Dict[str, torch.Tensor], temperature: float, calculate_entropy=False, raw_logit = False) -> torch.Tensor:
         """
         Returns:
             log_probs: # (bs, response_len)
@@ -166,12 +166,18 @@ class DataParallelPPOActor(BasePPOActor):
             logits: torch.Tensor = output.logits
             logits.div_(temperature)
             logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
+            if micro_batch.get("eos_args") is not None:
+                eos_args = micro_batch["eos_args"]
+                eos_token_id = eos_args["eos_token_id"]
+                logits[:, :, eos_token_id] *= eos_args.get("times", 1.0)
             log_probs = self.log_probs_from_logits(logits, responses)  # (bsz, response_length)
 
             # >>> 新增：计算 entropy <<<
             if calculate_entropy:
                 entropy = self.compute_entropy_from_logits(logits)  # (bsz, response_length)
-        if calculate_entropy:
+        if raw_logit:
+            return logits
+        elif calculate_entropy:
             return entropy
         else:
             return log_probs
@@ -228,11 +234,56 @@ class DataParallelPPOActor(BasePPOActor):
 
         for micro_batch in micro_batches:
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+            if data.meta_info.get("eos_args") is not None:
+                model_inputs["eos_args"] = data.meta_info["eos_args"]
             log_probs = self._forward_micro_batch(model_inputs, temperature=temperature)
             log_probs_lst.append(log_probs)
 
         log_probs = torch.concat(log_probs_lst, dim=0)
         return log_probs
+    
+    @torch.no_grad()
+    def compute_logits(self, data: DataProto) -> torch.Tensor:
+        """Compute the logits of the responses given input_ids, attention_mask and position_ids
+
+        Args:
+            data (DataProto): a DataProto containing keys
+
+                ``input_ids``: tensor of shape [batch_size, sequence_length]. torch.int64. Note that input_ids is the
+                concatenation of prompt and response. Note that ``sequence_length = prompt_length + response_length``.
+
+                ``attention_mask``: tensor of shape [batch_size, sequence_length]. torch.int64.
+
+                ``position_ids``: tensor of shape [batch_size, sequence_length]. torch.int64.
+
+                ``responses``:  tensor of shape [batch_size, response_length]. torch.int64.
+
+        Returns:
+            torch.Tensor: the logits tensor of shape [batch_size, response_length, vocab_size]
+        """
+        self.actor_module.eval()
+
+        temperature = data.meta_info["temperature"]
+        select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
+        if "multi_modal_inputs" in data.non_tensor_batch.keys():
+            non_tensor_select_keys = ["multi_modal_inputs"]
+        else:
+            non_tensor_select_keys = []
+
+        micro_batches = data.select(select_keys, non_tensor_select_keys).split(
+            self.config.micro_batch_size_per_device_for_experience
+        )
+        logits_lst = []
+        if self.rank == 0:
+            micro_batches = tqdm(micro_batches, desc="Compute logits", position=2)
+
+        for micro_batch in micro_batches:
+            model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+            logits = self._forward_micro_batch(model_inputs, temperature=temperature, raw_logit=True)
+            logits_lst.append(logits)
+
+        logits = torch.concat(logits_lst, dim=0)
+        return logits
 
     @torch.no_grad()
     def compute_entropy(self, data: DataProto) -> torch.Tensor:
@@ -341,8 +392,11 @@ class DataParallelPPOActor(BasePPOActor):
                         pg_loss = pg_loss + kl_loss * self.config.kl_coef
                         metrics["actor/kl_loss"] = kl_loss.detach().item()
                         metrics["actor/kl_coef"] = self.config.kl_coef
+
                     if self.config.use_entropy_loss:
+
                         pg_loss = pg_loss - entropy_loss * self.config.entropy_coef
+                        
 
 
                     loss = pg_loss / gradient_accumulation

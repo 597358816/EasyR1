@@ -329,31 +329,47 @@ def compute_policy_loss(
 
     """
     negative_approx_kl = log_probs - old_log_probs
+    negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
     # clamp the ratio before exp to avoid nan
     # see: https://github.com/pytorch/pytorch/issues/10729
-    ratio = torch.exp(negative_approx_kl)
     
-    inverse_old_probs = 1/torch.exp(old_log_probs)
+    
+    #inverse_old_probs = 1/torch.exp(old_log_probs)
+    #min = torch.log(torch.tensor(1.0 - clip_ratio_low,dtype=ratio.dtype,device=ratio.device)),
+    #max = torch.log(1.0 + torch.clamp(0.1*inverse_old_probs,max = 0.6))
+    
+    clip_ratio_low = 0.2
+    clip_ratio_high = 0.2
+    
+    ratio = torch.exp(negative_approx_kl)
 
     clipped_ratio = torch.exp(
         torch.clamp(
             negative_approx_kl, 
             min = np.log(1.0 - clip_ratio_low),
-            max = np.log(1.0 + 0.2)
-            #min = torch.log(torch.tensor(1.0 - clip_ratio_low,dtype=ratio.dtype,device=ratio.device)),
-            #max = torch.log(1.0 + torch.clamp(0.1*inverse_old_probs,max = 0.6))
+            max = np.log(1.0 + clip_ratio_high)
         )
     )
+    #clipped_ratio = torch.exp(
+    #   torch.clamp(
+    #       negative_approx_kl, 
+    #       min = np.log(1.0 - clip_ratio_low) + negative_approx_kl-negative_approx_kl.detach(),
+    #       max = np.log(1.0 + clip_ratio_high)+ torch.zeros_like(negative_approx_kl)
+    #   )
+    #)
 
     pg_loss = -advantages * ratio
     pg_loss2 = -advantages * clipped_ratio
     pg_loss3 = -advantages * clip_ratio_dual
 
     clipped_pg_loss_higher = torch.max(pg_loss, pg_loss2)  # clip if pg_loss < pg_loss2
-    pg_clipfrac_higher = (pg_loss < pg_loss2).float()
+    
+    pg_clipfrac_higher = ((pg_loss < pg_loss2) & (advantages > 0)).float()
+    pg_clipfrac_lower = ((pg_loss < pg_loss2) & (advantages < 0)).float()
+    
     clipped_pg_loss_lower = torch.min(clipped_pg_loss_higher, pg_loss3)  # clip if pg_loss > pg_loss3 and adv < 0
     final_pg_loss = torch.where(advantages < 0, clipped_pg_loss_lower, clipped_pg_loss_higher)
-    pg_clipfrac_lower = (clipped_pg_loss_higher > pg_loss3).float() * (advantages < 0).float()
+    #pg_clipfrac_lower = (clipped_pg_loss_higher > pg_loss3).float() * (advantages < 0).float()
     
     # version of dr.grpo
     '''

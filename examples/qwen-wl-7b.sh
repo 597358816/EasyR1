@@ -7,13 +7,15 @@ FORMAT_PROMPT="""You FIRST think about the reasoning process as an internal mono
 
 python3 -m verl.trainer.main \
     config=config.yaml \
-    data.train_files=hiyouga/geometry3k@train \
+    data.train_files=WaltonFuture/MMMT-ThinkLite-3k-random@train \
     data.val_files=hiyouga/geometry3k@test \
+    data.max_pixels=1000000 \
     data.format_prompt="${FORMAT_PROMPT}" \
     worker.actor.model.model_path=${MODEL_PATH} \
     trainer.project_name=ReplayEntropy \
-    trainer.experiment_name=Entropy-adv \
-    trainer.save_freq=-1 \
-    trainer.load_checkpoint_path=/home/dataset-assist-0/wc/EasyR1-main/examples/checkpoints/ReplayEntropy/Entropy-adv/global_step_40 \
-    trainer.total_episodes=100 \
+    trainer.experiment_name=EFRame-1.15-2-wl \
+    worker.actor.micro_batch_size_per_device_for_update=2 \
+    worker.actor.micro_batch_size_per_device_for_experience=4 \
+    trainer.save_freq=5 \
+    trainer.total_episodes=20 \
     trainer.n_gpus_per_node=8 \

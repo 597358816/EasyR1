@@ -185,6 +185,7 @@ def _compute_bool_reward_by_advantage(batch: DataProto, threshold = 0, absolute 
     bool_tensor = selected_mask.to(torch.bool)
     batch.batch["bool_reward"] = bool_tensor
     return batch
+
 def _compute_bool_reward_by_score(batch: DataProto, threshold = 0, absolute = True):
     # 原advantage如果大于threshold，则标记为True，否则为False。直接重建一个和advantage同shape的bool tensor放到batch中
     values = batch.batch["token_level_scores"].sum(dim = 1)
@@ -308,6 +309,21 @@ class RayPPOTrainer:
         val_reward_fn: Optional[Callable[[DataProto], Tuple[torch.Tensor, Dict[str, List[float]]]]] = None,
     ):
         self.tokenizer = tokenizer
+        if config.trainer.project_name == 'llama':
+            self.tokenizer.chat_template = (
+                "{% for message in messages %}"
+                "{% if message['role'] == 'system' %}"
+                "{{ '<|start_header_id|>system<|end_header_id|>\n\n' + message['content'] + '<|eot_id|>' }}"
+                "{% elif message['role'] == 'user' %}"
+                "{{ '<|start_header_id|>user<|end_header_id|>\n\n' + message['content'] + '<|eot_id|>' }}"
+                "{% elif message['role'] == 'assistant' %}"
+                "{{ '<|start_header_id|>assistant<|end_header_id|>\n\n' + message['content'] + '<|eot_id|>' }}"
+                "{% endif %}"
+                "{% endfor %}"
+                "{% if add_generation_prompt %}"
+                "{{ '<|start_header_id|>assistant<|end_header_id|>\n\n' }}"
+                "{% endif %}"
+            )
         self.processor = processor
         self.config = config
         self.reward_fn = reward_fn
@@ -644,6 +660,61 @@ class RayPPOTrainer:
         )
         metrics.update(global_balance_stats)
 
+    def apply_eos_boost_and_early_stop(
+        model_inputs,
+        meta_info,
+        response_length,
+        pad_to_length=None,
+    ):
+        eos_token_id = meta_info["eos_token_id"]
+        pad_token_id = meta_info.get("pad_token_id", eos_token_id)  # fallback to eos if missing
+
+        logits = model_inputs["logits"]        # (B, L_resp, V)
+        responses = model_inputs["responses"]  # (B, L_resp)
+
+        assert logits.shape[:2] == responses.shape, "logits and responses must match in B and L_resp"
+        B, L_resp, V = logits.shape
+
+        # Step 1: boost eos_token_id logits
+        logits[:, :, eos_token_id] *= 2.0
+
+        # Step 2: find first early-stop position per sample
+        eos_is_argmax = logits.argmax(dim=-1) == eos_token_id          # (B, L_resp)
+        not_already_eos = responses != eos_token_id                     # (B, L_resp)
+        candidate = eos_is_argmax & not_already_eos                     # (B, L_resp)
+
+        positions = torch.arange(L_resp, device=responses.device).unsqueeze(0)  # (1, L_resp)
+        first_eos_pos = torch.where(
+            candidate, positions, L_resp
+        ).min(dim=1).values  # (B,)
+
+        # Build mask: from first_eos_pos onward → set to eos_token_id
+        idx_range = torch.arange(L_resp, device=responses.device).unsqueeze(0)  # (1, L_resp)
+        should_replace = idx_range >= first_eos_pos.unsqueeze(1)                # (B, L_resp)
+        valid_mask = (first_eos_pos < L_resp).unsqueeze(1)                      # (B, 1)
+        final_mask = should_replace & valid_mask                                # (B, L_resp)
+
+        # ✅ Early-stop fill: use eos_token_id (semantic termination)
+        responses.masked_fill_(final_mask, eos_token_id)
+
+        # Optional: length alignment padding — use pad_token_id (not eos!)
+        if pad_to_length is not None:
+            if pad_to_length > L_resp:
+                # Right-pad with pad_token_id (standard practice)
+                padded = torch.full(
+                    (B, pad_to_length),
+                    pad_token_id,  # ← key change: use pad_token_id here
+                    dtype=responses.dtype,
+                    device=responses.device
+                )
+                padded[:, :L_resp] = responses
+                model_inputs["responses"] = padded
+            elif pad_to_length < L_resp:
+                model_inputs["responses"] = responses[:, :pad_to_length]
+            else:
+                model_inputs["responses"] = responses
+        else:
+            model_inputs["responses"] = responses  # keep original
 
     def _update_critic(self, batch: DataProto, timing_raw, metrics):
         if self.use_critic:
@@ -671,7 +742,14 @@ class RayPPOTrainer:
             }
             metrics.update(reward_metrics)
 
-    def _compute_old_log_probs(self, batch: DataProto, timing_raw, temperature = None):
+    def _compute_old_log_probs(self, batch: DataProto, timing_raw, temperature = None, eos_args = None):
+        if eos_args is not None:
+            with _timer("old-eos", timing_raw):
+                batch_eos = deepcopy(batch)
+                batch_eos.meta_info["eos_args"] = eos_args
+                old_log_probs = self.actor_rollout_wg.compute_log_probs(batch_eos)
+                batch.batch["old_log_probs_eos"] = old_log_probs.batch["old_log_probs"]
+            return 
         if temperature is None:
             with _timer("old", timing_raw):
                 batch.meta_info["temperature"] = 1.0
@@ -732,8 +810,9 @@ class RayPPOTrainer:
         difficult_record = []
         overlong_record = []
         overlong_positive_record = []
-        entropy = 0
-        entropy_base = 0.5
+        entropy = 0.0
+        entropy_delta_list = []
+        
         val_metrics: Optional[Dict[str, Any]] = None
 
         # load checkpoint before doing anything
@@ -786,26 +865,24 @@ class RayPPOTrainer:
                     self._compute_values(batch, timing_raw)
                     self._compute_adv(batch, timing_raw)
 
-                    if replay_buffer.capacity == 0:
-                        replay_buffer.capacity =  2 * initial_batch_size
-                    if batch_buffer.capacity == 0:
-                        batch_buffer.capacity = 4 * initial_batch_size
                     
-                    alg = "entropy_importance_sampling"
+                    alg = "AEPO"
+                    entropy_base = 0.5
+
                     if alg=="EFRame":
-                    
+                        if replay_buffer.capacity == 0:
+                            replay_buffer.capacity =  2 * initial_batch_size
+                        if batch_buffer.capacity == 0:
+                            batch_buffer.capacity = 4 * initial_batch_size
                         # select prompts
                         count_occurrences(batch,"advantages")
                         difficult_prompt_indices = _select_hard_prompts(batch, self.config.worker.rollout.n, difficult_record, 0.01)
                         medium_advantage_batch = _select_by_advantage(batch, threshold = 0.05)
-                        
                         gen_difficult_batch = gen_batch.select_by_index(difficult_prompt_indices)
-
-                        
                         if len(gen_difficult_batch) % 32 > 0:
                             gen_difficult_batch = duplicate_gen_batch(gen_difficult_batch, 32)
 
-                        temperature = 1.2
+                        temperature = 1.15
                         rollout_n = 20
                         gen_difficult_batch.meta_info["temperature"] = temperature
                         gen_difficult_batch.meta_info["n"] = rollout_n
@@ -842,7 +919,7 @@ class RayPPOTrainer:
                             self._balance_batch(batch, metrics)
                             self._compute_old_log_probs(batch, timing_raw)
                             self._compute_ref_log_probs(batch, timing_raw)
-                            high_advantage_batch = _select_by_advantage(batch, threshold = 1)
+                            high_advantage_batch = _select_by_advantage(batch, threshold = 1, absolute = False)
                         
                             print("final batch size is:", len(batch))
                             self._update_critic(batch, timing_raw, metrics)
@@ -861,18 +938,21 @@ class RayPPOTrainer:
                             self._update_actor(replay_batch, timing_raw, metrics)
                             print("end replay buffer")  
 
-                    elif alg=="entropy":
+                    elif alg=="AEPO":
                         temperature = 1
                         if entropy <= entropy_base:
                             temperature = 1.2
                         elif entropy > entropy_base:  
-                            temperature = 0.8     
+                            temperature = 0.8   
+                        # entropy_target = 0.01 * sum(entropy_delta_list)+entropy_delta 
+                        # temperature = 1 + max(-0.2, min(0.2, entropy_target))
+                        # metrics["temperature"] = temperature
+                        gen_batch_bak = gen_batch_bak[:len(gen_batch_bak) // 8]
                         gen_batch_bak.meta_info["temperature"] = temperature
-                        gen_batch_bak.meta_info["n"] = 5   
                         
                         with _timer("gen", timing_raw):  
                             gen_batch_output_bak = self.actor_rollout_wg.generate_sequences(gen_batch_bak)
-                        batch_bak = batch_bak.union(gen_batch_output_bak)    
+                        batch_bak = batch_bak[:len(batch_bak) // 8].union(gen_batch_output_bak)    
                         self._compute_reward(batch_bak, timing_raw, metrics)
                         batch_bak.meta_info["global_token_num"] = torch.sum(batch_bak.batch["attention_mask"], dim=-1).tolist()
                         self._compute_values(batch_bak, timing_raw)
@@ -884,9 +964,9 @@ class RayPPOTrainer:
                         entropy_controller = _select_by_advantage(batch_bak, threshold = 0.05, absolute=False)
                         entropy_controller.batch["advantages"] = torch.ones_like(entropy_controller.batch["advantages"])
                         if entropy <= entropy_base:
-                            sample_num = min(120, len(entropy_controller))
+                            sample_num = min(16, len(entropy_controller))
                         elif entropy > entropy_base:     
-                            sample_num = min(80, len(entropy_controller))    
+                            sample_num = min(8, len(entropy_controller))    
                         entropy_batch = DataProto.concat([entropy_controller[:sample_num], batch[sample_num:]])
 
                         self._compute_old_log_probs(entropy_batch, timing_raw)
@@ -901,11 +981,39 @@ class RayPPOTrainer:
                         self._update_critic(entropy_batch, timing_raw, metrics)
                         self._update_actor(entropy_batch, timing_raw, metrics) 
                         
-                    elif alg=="entropy_importance_sampling":  
-                        # batch = _select_by_advantage(batch, threshold = 0.05)
-                        # batch_buffer.add(batch)
-                        # if batch_buffer.size >= initial_batch_size:
-                        #     batch = batch_buffer.pop((batch_buffer.size // initial_batch_size) * initial_batch_size)
+                    elif alg=="AEPO2":  
+                        temperature = 1          
+                        if entropy <= entropy_base:
+                            temperature = 1.2
+                        elif entropy > entropy_base:     
+                            temperature = 0.8   
+
+                        entropy_delta = entropy_base-entropy
+                        entropy_delta_list.append(entropy_delta)
+
+                        _compute_bool_reward_by_score(batch, threshold = 0.05, absolute=False)
+                        self._compute_old_log_probs(batch, timing_raw)
+                        self._compute_old_log_probs(batch, timing_raw, temperature = temperature)
+                    
+                        old_log_probs = batch.batch['old_log_probs']
+                        old_log_probs_t = batch.batch['old_log_probs_t']
+                        entropy_factor = torch.exp(old_log_probs_t - old_log_probs)
+                        true_ratio = (batch.batch["bool_reward"]==1).sum() / len(batch)
+                        print("batch.batch['bool_reward'].shape:", batch.batch['bool_reward'].shape)
+                        alpha = entropy_delta 
+                        metrics["alpha/alpha"] = alpha
+                        metrics["alpha/current"] = entropy_delta
+                        metrics["alpha/history"] = 0.01 * sum(entropy_delta_list)
+                        alpha = abs(alpha)
+                        alpha = min(alpha, 0.1)
+                        alpha = alpha / true_ratio
+                        alpha = alpha / (alpha + 1)
+                        batch.batch["advantages"] = (1-alpha) * batch.batch["advantages"] + alpha * batch.batch["bool_reward"].to(batch.batch["advantages"].dtype).unsqueeze(1) * entropy_factor
+                        self._compute_ref_log_probs(batch, timing_raw)
+                        self._update_critic(batch, timing_raw, metrics)
+                        self._update_actor(batch, timing_raw, metrics)
+                        
+                    elif alg=="shorter-important-sampling":  
                         temperature = 1          
                         if entropy <= entropy_base:
                             temperature = 1.2
@@ -913,24 +1021,21 @@ class RayPPOTrainer:
                             temperature = 0.8        
                         _compute_bool_reward_by_score(batch, threshold = 0.05, absolute=False)
                         self._compute_old_log_probs(batch, timing_raw)
-                        self._compute_old_log_probs(batch, timing_raw, temperature = temperature)
-                        
+                        eos_args = {"eos_token_id": self.tokenizer.eos_token_id, "times":2}
+                        self._compute_old_log_probs(batch, timing_raw, eos_args)
+                    
                         old_log_probs = batch.batch['old_log_probs']
-                        old_log_probs_t = batch.batch['old_log_probs_t']
-                        entropy_factor =  torch.exp(old_log_probs_t - old_log_probs)
+                        old_log_probs_e = batch.batch['old_log_probs_e']
+                        entropy_factor =  torch.exp(old_log_probs_e - old_log_probs)
                         true_ratio = (batch.batch["bool_reward"]==1).sum() / len(batch)
-                        # print(entropy_factor[0].tolist())
-                        # print(batch.batch['old_log_probs'][0].tolist())
-                        # print(batch.batch["bool_reward"].tolist())
-                        # print("entropy_factor.shape:", entropy_factor.shape)
-                        # print("batch.batch['bool_reward'].shape:", batch.batch['bool_reward'].shape)
-                        alpha = 0.15
-                        batch.batch["advantages"] += alpha/true_ratio  * batch.batch["bool_reward"].to(batch.batch["advantages"].dtype).unsqueeze(1) * entropy_factor
-                        #batch.batch["advantages"] = batch.batch["advantages"] + alpha * batch.batch["bool_reward"].to(batch.batch["advantages"].dtype).unsqueeze(1) * entropy_factor
+                        print("batch.batch['bool_reward'].shape:", batch.batch['bool_reward'].shape)
+                        alpha = 0.1 / true_ratio
+                        # alpha = 0.2
+                        alpha = alpha / (alpha + 1)
+                        batch.batch["advantages"] = (1-alpha) * batch.batch["advantages"] + alpha * batch.batch["bool_reward"].to(batch.batch["advantages"].dtype).unsqueeze(1) * entropy_factor
                         self._compute_ref_log_probs(batch, timing_raw)
                         self._update_critic(batch, timing_raw, metrics)
                         self._update_actor(batch, timing_raw, metrics)
-                        
                     elif alg=="entropy_importance_sampling_reverse":  
                         temperature = 1          
                         if entropy <= entropy_base:
@@ -954,7 +1059,30 @@ class RayPPOTrainer:
                         self._compute_ref_log_probs(batch, timing_raw)
                         self._update_critic(batch, timing_raw, metrics)
                         self._update_actor(batch, timing_raw, metrics)
-                    elif alg=="grpo":                   
+                    elif alg=="GRPO":                   
+                        self._compute_old_log_probs(batch, timing_raw)
+                        self._compute_ref_log_probs(batch, timing_raw)
+                        self._update_critic(batch, timing_raw, metrics)
+                        self._update_actor(batch, timing_raw, metrics)
+                    elif alg=="short-GRPO-tmp":  
+                        # 截取简短回答的GRPO版本
+                        
+                        logits = self.actor_rollout_wg.compute_logits(batch)
+                        batch = batch.union(logits)
+
+                        model_inputs = {**batch.batch, **batch.non_tensor_batch}
+                        responses = model_inputs["responses"]
+                        response_length = responses.size(1)
+                        attention_mask = model_inputs["attention_mask"]
+                        response_mask = attention_mask[:, -response_length:]
+                        logits = model_inputs["logits"]
+                        advantages = model_inputs["advantages"]
+                        self.apply_eos_boost_and_early_stop(
+                            model_inputs,
+                            meta_info=batch.meta_info,
+                            response_length=response_length,
+                            pad_to_length=response_length,
+                        )
                         self._compute_old_log_probs(batch, timing_raw)
                         self._compute_ref_log_probs(batch, timing_raw)
                         self._update_critic(batch, timing_raw, metrics)
@@ -968,15 +1096,13 @@ class RayPPOTrainer:
                         self._compute_ref_log_probs(batch, timing_raw)
                         self._update_critic(batch, timing_raw, metrics)
                         self._update_actor(batch, timing_raw, metrics)
-                    elif alg=="entropy_reward_regularization":                   
-
-                        self._compute_old_log_probs(batch, timing_raw)
-                        self._compute_ref_log_probs(batch, timing_raw)
-                        self._update_critic(batch, timing_raw, metrics)
-                        self._update_actor(batch, timing_raw, metrics)
                         
                         
-                    elif alg=="dapo":           
+                    elif alg=="DAPO":     
+                        if replay_buffer.capacity == 0:
+                            replay_buffer.capacity =  2 * initial_batch_size
+                        if batch_buffer.capacity == 0:
+                            batch_buffer.capacity = 4 * initial_batch_size      
                         batch = _select_by_advantage(batch, threshold = 0.05)
                         batch_buffer.add(batch)
 
