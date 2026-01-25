@@ -26,6 +26,7 @@ class RewardConfig:
     score_function: Optional[str] = None
     score_function_kwargs: dict = field(default_factory=dict)
     skip_special_tokens: bool = True
+    length_reward: Optional[str] = None
 
     def post_init(self):
         if self.score_function is not None and os.path.exists(self.score_function):

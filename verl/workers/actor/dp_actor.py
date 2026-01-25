@@ -166,10 +166,25 @@ class DataParallelPPOActor(BasePPOActor):
             logits: torch.Tensor = output.logits
             logits.div_(temperature)
             logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
+            # if micro_batch.get("eos_args") is not None:
+            #     eos_args = micro_batch["eos_args"]
+            #     eos_token_id = eos_args["eos_token_id"]
+            #     logits[:, :, eos_token_id] *= eos_args.get("times", 1.0)
             if micro_batch.get("eos_args") is not None:
-                eos_args = micro_batch["eos_args"]
-                eos_token_id = eos_args["eos_token_id"]
-                logits[:, :, eos_token_id] *= eos_args.get("times", 1.0)
+               eos_args = micro_batch["eos_args"]
+               eos_token_id = int(eos_args["eos_token_id"])
+               times = float(eos_args.get("times", 1.0))
+               if times <= 0:
+                   raise ValueError(f"eos_args.times must be > 0, got {times}")
+               eps = 1e-6
+               log_p = torch.log_softmax(logits, dim=-1)              # [B, T, V]
+               p_old = log_p[..., eos_token_id].exp()                 # [B, T]
+               p_new = (p_old * times).clamp(max=1.0 - eps)           # [B, T]
+               denom = (1.0 - p_old).clamp_min(eps)                   # avoid /0
+               r = ((1.0 - p_new) / denom).clamp_min(eps)             # [B, T]
+               log_p = log_p + torch.log(r).unsqueeze(-1)             # scale all
+               log_p[..., eos_token_id] = torch.log(p_new)            # set eos exactly
+               logits.copy_(log_p)
             log_probs = self.log_probs_from_logits(logits, responses)  # (bsz, response_length)
 
             # >>> 新增：计算 entropy <<<
