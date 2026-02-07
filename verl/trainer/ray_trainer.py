@@ -175,6 +175,36 @@ def _select_by_advantage(batch: DataProto, threshold = 0, absolute = True):
         return batch.select_by_index(index_list=selected_indices.tolist())
     else:
         return None
+    
+
+def _select_positive(batch: DataProto, adv_threshold: float = 0.0, reward_threshold: float = 0.0):
+    advantages = batch.batch["advantages"][:, 0]   # [B]
+    values = batch.batch["token_level_scores"].sum(dim=1)
+    bool_reward = (values > reward_threshold)
+    batch.batch["bool_reward"] = bool_reward.to(torch.bool)
+    selected_mask = (advantages > adv_threshold) & bool_reward
+    selected_indices = selected_mask.nonzero(as_tuple=False).squeeze(-1) 
+    print(f"select samples by (adv>{adv_threshold}) & (reward>{reward_threshold}) : {selected_indices.numel()}")
+
+    if selected_indices.numel() > 0:
+        return batch.select_by_index(index_list=selected_indices.tolist())
+    else:
+        return None
+
+
+
+    
+def _select_negative(batch: DataProto, threshold = 0):
+    advantages = batch.batch["advantages"][:,0]
+
+    selected_mask = advantages < threshold
+    selected_indices = selected_mask.nonzero(as_tuple=False).squeeze(-1)
+    print("select negative samples:", len(selected_indices))
+    if len(selected_indices) > 0:
+        return batch.select_by_index(index_list=selected_indices.tolist())
+    else:
+        return None    
+    
 def _compute_bool_reward_by_advantage(batch: DataProto, threshold = 0, absolute = True):
     # 原advantage如果大于threshold，则标记为True，否则为False。直接重建一个和advantage同shape的bool tensor放到batch中
     advantages = batch.batch["advantages"][:,0]
@@ -788,6 +818,17 @@ class RayPPOTrainer:
                 gamma=self.config.algorithm.gamma,
                 lam=self.config.algorithm.lam,
             )
+    def _get_resp_lens(self, dp: DataProto) -> torch.Tensor:
+        if "response_mask" in dp.batch:
+            return dp.batch["response_mask"].sum(dim=1)
+        elif "responses" in dp.batch:
+            return (dp.batch["responses"] != self.tokenizer.eos_token_id).sum(dim=1)
+        else:
+            return torch.zeros(
+                len(dp),
+                dtype=torch.long,
+                device=dp.batch["advantages"].device if "advantages" in dp.batch else batch_bak.batch["attention_mask"].device,
+            )
 
 
     def fit(self):
@@ -872,7 +913,10 @@ class RayPPOTrainer:
 
                     
                     alg = "GRPO"
-                    entropy_base = 0.5
+                    entropy_base = 0.25
+                    if self.global_step > 151:
+                        print(exit1)
+                    
                     if alg=="EFRame":
                         if replay_buffer.capacity == 0:
                             replay_buffer.capacity =  2 * initial_batch_size
@@ -945,12 +989,10 @@ class RayPPOTrainer:
                     elif alg=="AEPO":
                         temperature = 1
                         if entropy <= entropy_base:
-                            temperature = 1.2
+                            temperature = 1 + max(entropy_base - entropy, 0.2)
                         elif entropy > entropy_base:  
-                            temperature = 0.8   
-                        # entropy_target = 0.01 * sum(entropy_delta_list)+entropy_delta 
-                        # temperature = 1 + max(-0.2, min(0.2, entropy_target))
-                        # metrics["temperature"] = temperature
+                            temperature = 1 - max(entropy - entropy_base, 0.2)  
+                        metrics["temperature"] = temperature
                         gen_batch_bak = gen_batch_bak[:len(gen_batch_bak) // 8]
                         gen_batch_bak.meta_info["temperature"] = temperature
                         
@@ -1009,15 +1051,18 @@ class RayPPOTrainer:
                         self._update_critic(entropy_batch, timing_raw, metrics)
                         self._update_actor(entropy_batch, timing_raw, metrics) 
                         
-                    elif alg=="AEPO-short" or alg=="AEPO-long":
+                    elif alg=="AEPO-short":
                         temperature = 1
                         if entropy <= entropy_base:
-                            temperature = 1.2
-                        elif entropy > entropy_base:  
-                            temperature = 0.8   
+                            temperature = 1 + max(entropy_base - entropy, 0.2)
+                            pos_num = 16
+                            neg_num = 0
+                        elif entropy > entropy_base:
+                            temperature = 1 - max(entropy - entropy_base, 0.2)
+                            pos_num = 8
+                            neg_num = 0
                         gen_batch_bak = gen_batch_bak[:len(gen_batch_bak)]
                         gen_batch_bak.meta_info["temperature"] = temperature
-                        
                         with _timer("gen", timing_raw):  
                             gen_batch_output_bak = self.actor_rollout_wg.generate_sequences(gen_batch_bak)
                         batch_bak = batch_bak[:len(batch_bak)].union(gen_batch_output_bak)    
@@ -1026,42 +1071,99 @@ class RayPPOTrainer:
                         self._compute_values(batch_bak, timing_raw)
                         self._compute_adv(batch_bak, timing_raw)
                         
-                        entropy_controller = _select_by_advantage(batch_bak, threshold = 0.05, absolute=False)
-
-                        entropy_controller.batch["advantages"] = torch.ones_like(
-                            entropy_controller.batch["advantages"]
-                        )
-                        if entropy <= entropy_base:
-                            sample_num = min(16, len(entropy_controller))
-                        else:
-                            sample_num = min(8, len(entropy_controller))
-
-                        # reorder entropy_controller so the shortest responses are first
-                        if "response_mask" in entropy_controller.batch:
-                            resp_mask = entropy_controller.batch["response_mask"]
-                            resp_lens = resp_mask.sum(dim=1)
-                        elif "responses" in entropy_controller.batch:
-                            resp_lens = (
-                                entropy_controller.batch["responses"] != self.tokenizer.eos_token_id
-                            ).sum(dim=1)
-                        else:
-                            resp_lens = torch.zeros(
-                                len(entropy_controller), dtype=torch.long, device=entropy_controller.batch["advantages"].device
+                        positive_samples = _select_by_advantage(batch_bak, threshold = 0.05, absolute=False)
+                        negative_samples = _select_negative(batch_bak)
+                        negative_samples.pop(batch_keys=["bool_reward"])
+                        if "advantages" not in positive_samples.batch:
+                            positive_samples.batch["advantages"] = torch.zeros(
+                                len(positive_samples),
+                                dtype=torch.float32,
+                                device=batch_bak.batch["attention_mask"].device,
                             )
-                        if alg=="AEPO-short":
-                            # shorter responses
-                            sorted_idx = torch.argsort(resp_lens)
+                        positive_samples.batch["advantages"] = torch.ones_like(positive_samples.batch["advantages"])
+                        pos_lens = self._get_resp_lens(positive_samples)
+                        pos_sorted_idx = torch.argsort(pos_lens)  # short first
+                        positive_samples.reorder(torch.cat([pos_sorted_idx[:pos_num], pos_sorted_idx[pos_num:]], dim=0))
+
+
+                        if "advantages" not in negative_samples.batch:
+                            negative_samples.batch["advantages"] = torch.zeros(
+                                len(negative_samples),
+                                dtype=torch.float32,
+                                device=positive_samples.batch["advantages"].device,
+                            )
+                        negative_samples.batch["advantages"] = -torch.ones_like(negative_samples.batch["advantages"])
+                        neg_lens = self._get_resp_lens(negative_samples)
+                        neg_sorted_idx = torch.argsort(-neg_lens)  # long first
+                        negative_samples.reorder(torch.cat([neg_sorted_idx[:neg_num], neg_sorted_idx[neg_num:]], dim=0))
+
+
+                        batch = DataProto.concat([
+                            positive_samples[:pos_num],
+                            negative_samples[:neg_num],
+                            batch[pos_num + neg_num:], 
+                        ])
+
+                        self._compute_old_log_probs(batch, timing_raw)
+                        self._compute_ref_log_probs(batch, timing_raw)
+                        self._update_critic(batch, timing_raw, metrics)
+                        self._update_actor(batch, timing_raw, metrics)
+                        
+                    elif alg == "AEPO-short2":
+                        temperature = 1
+                        if entropy <= entropy_base:
+                            #temperature = 1 + max(entropy_base - entropy, 0.2)
+                            pos_num = 16
                         else:
-                            # longer responses
-                            sorted_idx = torch.argsort(-resp_lens)
-                        sample_num = min(sample_num, len(entropy_controller))
-                        new_order = torch.cat([sorted_idx[:sample_num], sorted_idx[sample_num:]], dim=0)
-                        entropy_controller.reorder(new_order)
-                        entropy_batch = DataProto.concat([entropy_controller[:sample_num], batch[sample_num:]])
-                        self._compute_old_log_probs(entropy_batch, timing_raw)
-                        self._compute_ref_log_probs(entropy_batch, timing_raw)
-                        self._update_critic(entropy_batch, timing_raw, metrics)
-                        self._update_actor(entropy_batch, timing_raw, metrics) 
+                            #temperature = 1 - max(entropy - entropy_base, 0.2)
+                            pos_num = 16
+
+
+                        gen_batch_bak = gen_batch_bak[:len(gen_batch_bak)]
+                        gen_batch_bak.meta_info["temperature"] = temperature
+
+                        with _timer("gen", timing_raw):
+                            gen_batch_output_bak = self.actor_rollout_wg.generate_sequences(gen_batch_bak)
+
+                        batch_bak = batch_bak[:len(batch_bak)].union(gen_batch_output_bak)
+                        self._compute_reward(batch_bak, timing_raw, metrics)
+                        self._compute_values(batch_bak, timing_raw)
+                        self._compute_adv(batch_bak, timing_raw)
+
+
+                        B = len(batch_bak)
+                        device = batch_bak.batch["attention_mask"].device
+                        group_n = int(self.config.worker.rollout.n)
+
+                        lens = self._get_resp_lens(batch_bak).to(torch.float32)                 # [B]
+                        idx0 = torch.arange(B, device=device, dtype=torch.long)            # 原始位置
+                        group_ids = idx0 // group_n                                        # [B]
+                        num_groups = int(group_ids.max().item()) + 1
+
+                        group_sum = torch.zeros(num_groups, device=device, dtype=torch.float32)
+                        group_cnt = torch.zeros(num_groups, device=device, dtype=torch.float32)
+                        group_sum.scatter_add_(0, group_ids, lens)
+                        group_cnt.scatter_add_(0, group_ids, torch.ones_like(lens))
+                        group_mean = group_sum / group_cnt.clamp_min(1.0)
+
+                        rel_len = lens - group_mean[group_ids]                             # [B]
+                        sort_idx = torch.argsort(rel_len)                                  # rel_len 最小(最相对短)在前
+                        batch_bak.reorder(sort_idx)
+
+                        batch_bak.meta_info["global_token_num"] = torch.sum(batch_bak.batch["attention_mask"], dim=-1).tolist() 
+                        positive_samples = _select_by_advantage(batch_bak, threshold = 0.05, absolute=False)
+                        positive_samples.batch["advantages"] = torch.ones_like(positive_samples.batch["advantages"])
+
+                        batch = DataProto.concat([
+                            positive_samples[:pos_num],
+                            batch[pos_num:],
+                        ])
+
+                        self._compute_old_log_probs(batch, timing_raw)
+                        self._compute_ref_log_probs(batch, timing_raw)
+                        self._update_critic(batch, timing_raw, metrics)
+                        self._update_actor(batch, timing_raw, metrics)
+
                         
                     elif alg=="AEPO2":  
                         temperature = 1          

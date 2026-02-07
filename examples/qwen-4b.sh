@@ -1,7 +1,7 @@
 set -x
 
 MODEL_PATH=/home/dataset-local/models/Qwen/Qwen3-4B  # replace it with your local file path
-NAME="qwen3-4b-LP2"
+NAME="qwen3-4b-LP1-AEPOshort-notemp-relative"
 
 FORMAT_PROMPT="""You FIRST think about the reasoning process as an internal monologue and then provide the final answer. The reasoning process MUST BE enclosed within <think> </think> tags. The final answer MUST BE put in \boxed{}."""
 #FORMAT_PROMPT="""Solve the problem and provide only the final answer. Do NOT include any reasoning steps, explanations, or intermediate calculations. The final answer MUST be enclosed in \boxed{}."""
@@ -26,7 +26,8 @@ python3 -m verl.trainer.main \
     worker.actor.micro_batch_size_per_device_for_experience=4 \
     worker.actor.global_batch_size=64 \
     trainer.save_checkpoint_path="/home/dataset-local/checkpoints/Qwen3-4B/${NAME}" \
-    worker.reward.length_reward="LP2" \
+    worker.reward.length_reward="LP1" \
+    trainer.load_checkpoint_path=/home/dataset-local/checkpoints/Qwen3-4B/qwen3-4b-LP1-AEPOshort-notemp-relative/global_step_40
     ##worker.actor.use_entropy_loss=true \
     #trainer.load_checkpoint_path=/home/dataset-assist-0/wc/EasyR1-main/examples/checkpoints/easyr1/qwen3-4b-AEPO-0.25/global_step_140 \
 
