@@ -1,7 +1,7 @@
 set -x
   
 MODEL_PATH=/home/dataset-local/models/deepseek/DeepSeek-R1-Distill-Qwen-7B  # replace it with your local file path
-NAME="dsqw-7b-shorterbetter"
+NAME="dsqw-7b-LP1-AEPOshort2"
 FORMAT_PROMPT="""You FIRST think about the reasoning process as an internal monologue and then provide the final answer.
  The reasoning process MUST BE enclosed within <think> </think> tags. The final answer MUST BE put in \boxed{}."""
 
@@ -25,8 +25,8 @@ python3 -m verl.trainer.main \
     trainer.total_episodes=2 \
     trainer.val_before_train=false \
     trainer.save_checkpoint_path="/home/dataset-local/checkpoints/DSQW-7B/${NAME}" \
-    worker.reward.length_reward="ShorterBetter" \
-    #trainer.load_checkpoint_path="/home/dataset-local/checkpoints/DSQW-7B/${NAME}/global_step_100"
+    worker.reward.length_reward="LP1" \
+    #trainer.load_checkpoint_path="/home/dataset-local/checkpoints/DSQW-7B/${NAME}/global_step_50"
     #worker.rollout.max_num_batched_tokens=10240 \
     #worker.actor.use_entropy_loss=true 
     #algorithm.disable_kl=false \

@@ -912,7 +912,7 @@ class RayPPOTrainer:
                         print("Failed to decode first response:", e)
 
                     
-                    alg = "GRPO"
+                    alg = "AEPO-short3"
                     entropy_base = 0.25
                     if self.global_step > 151:
                         print(exit1)
@@ -1053,14 +1053,8 @@ class RayPPOTrainer:
                         
                     elif alg=="AEPO-short":
                         temperature = 1
-                        if entropy <= entropy_base:
-                            temperature = 1 + max(entropy_base - entropy, 0.2)
-                            pos_num = 16
-                            neg_num = 0
-                        elif entropy > entropy_base:
-                            temperature = 1 - max(entropy - entropy_base, 0.2)
-                            pos_num = 8
-                            neg_num = 0
+                        pos_num = 12
+                        neg_num = 0
                         gen_batch_bak = gen_batch_bak[:len(gen_batch_bak)]
                         gen_batch_bak.meta_info["temperature"] = temperature
                         with _timer("gen", timing_raw):  
@@ -1073,7 +1067,6 @@ class RayPPOTrainer:
                         
                         positive_samples = _select_by_advantage(batch_bak, threshold = 0.05, absolute=False)
                         negative_samples = _select_negative(batch_bak)
-                        negative_samples.pop(batch_keys=["bool_reward"])
                         if "advantages" not in positive_samples.batch:
                             positive_samples.batch["advantages"] = torch.zeros(
                                 len(positive_samples),
@@ -1113,10 +1106,10 @@ class RayPPOTrainer:
                         temperature = 1
                         if entropy <= entropy_base:
                             #temperature = 1 + max(entropy_base - entropy, 0.2)
-                            pos_num = 16
+                            pos_num = 12
                         else:
                             #temperature = 1 - max(entropy - entropy_base, 0.2)
-                            pos_num = 16
+                            pos_num = 12
 
 
                         gen_batch_bak = gen_batch_bak[:len(gen_batch_bak)]
@@ -1135,7 +1128,7 @@ class RayPPOTrainer:
                         device = batch_bak.batch["attention_mask"].device
                         group_n = int(self.config.worker.rollout.n)
 
-                        lens = self._get_resp_lens(batch_bak).to(torch.float32)                 # [B]
+                        lens = self._get_resp_lens(batch_bak).to(torch.float32)            # [B]
                         idx0 = torch.arange(B, device=device, dtype=torch.long)            # 原始位置
                         group_ids = idx0 // group_n                                        # [B]
                         num_groups = int(group_ids.max().item()) + 1
@@ -1147,12 +1140,21 @@ class RayPPOTrainer:
                         group_mean = group_sum / group_cnt.clamp_min(1.0)
 
                         rel_len = lens - group_mean[group_ids]                             # [B]
+                        batch_bak.batch["_rel_len_tmp"] = rel_len
+                        batch_bak.batch["_len_tmp"] = lens
                         sort_idx = torch.argsort(rel_len)                                  # rel_len 最小(最相对短)在前
                         batch_bak.reorder(sort_idx)
 
                         batch_bak.meta_info["global_token_num"] = torch.sum(batch_bak.batch["attention_mask"], dim=-1).tolist() 
                         positive_samples = _select_by_advantage(batch_bak, threshold = 0.05, absolute=False)
                         positive_samples.batch["advantages"] = torch.ones_like(positive_samples.batch["advantages"])
+                        
+                        pos_rel_len = positive_samples.batch["_rel_len_tmp"][:pos_num].float().mean().detach().item()
+                        pos_len = positive_samples.batch["_len_tmp"][:pos_num].float().mean().detach().item()
+                        metrics["response_length/rel_len"] = pos_rel_len
+                        metrics["response_length/pos_len"] = pos_len
+                        positive_samples.batch.pop("_rel_len_tmp", None)
+                        batch_bak.batch.pop("_rel_len_tmp", None)
 
                         batch = DataProto.concat([
                             positive_samples[:pos_num],
@@ -1163,9 +1165,43 @@ class RayPPOTrainer:
                         self._compute_ref_log_probs(batch, timing_raw)
                         self._update_critic(batch, timing_raw, metrics)
                         self._update_actor(batch, timing_raw, metrics)
+                    elif alg == "AEPO-short3":
+                        pos_num = 12
+                        B = len(batch)
+                        device = batch.batch["attention_mask"].device
+                        group_n = int(self.config.worker.rollout.n)
+                        lens = self._get_resp_lens(batch).to(torch.float32)
+                        idx0 = torch.arange(B, device=device, dtype=torch.long)
+                        group_ids = idx0 // group_n
+                        num_groups = int(group_ids.max().item()) + 1
+                        group_sum = torch.zeros(num_groups, device=device, dtype=torch.float32)
+                        group_cnt = torch.zeros(num_groups, device=device, dtype=torch.float32)
+                        group_sum.scatter_add_(0, group_ids, lens)
+                        group_cnt.scatter_add_(0, group_ids, torch.ones_like(lens))
+                        group_mean = group_sum / group_cnt.clamp_min(1.0)
+                        rel_len = lens - group_mean[group_ids]
+                        sort_idx = torch.argsort(rel_len)  
+                        adv = batch.batch["advantages"]
+                        adv0 = adv[:, 0] 
+
+                        pos_mask_sorted = adv0[sort_idx] > 0.05
+                        sel_idx = sort_idx[pos_mask_sorted][:pos_num]  # [k]
+                        k = int(sel_idx.numel())
+                        if k > 0:
+                            adv = batch.batch["advantages"]          
+                            adv[sel_idx] = adv[sel_idx] + 1.0       
+                            batch.batch["advantages"] = adv
+                            metrics["response_length/pos_len"] = lens[sel_idx].mean().detach().item()
+                            metrics["response_length/rel_len"] = rel_len[sel_idx].mean().detach().item()
+
+
+                        self._compute_old_log_probs(batch, timing_raw)
+                        self._compute_ref_log_probs(batch, timing_raw)
+                        self._update_critic(batch, timing_raw, metrics)
+                        self._update_actor(batch, timing_raw, metrics)
 
                         
-                    elif alg=="AEPO2":  
+                    elif alg=="DCPO":  
                         temperature = 1          
                         if entropy <= entropy_base:
                             temperature = 1.2
@@ -1196,25 +1232,6 @@ class RayPPOTrainer:
                         self._compute_ref_log_probs(batch, timing_raw)
                         self._update_critic(batch, timing_raw, metrics)
                         self._update_actor(batch, timing_raw, metrics)
-                    elif alg=="shorter-important-sampling":  
-                        _compute_bool_reward_by_score(batch, threshold = 0.05, absolute=False)
-                        self._compute_old_log_probs(batch, timing_raw)
-                        eos_args = {"eos_token_id": self.tokenizer.eos_token_id, "times":10}
-                        self._compute_old_log_probs(batch, timing_raw, eos_args=eos_args)
-                    
-                        old_log_probs = batch.batch['old_log_probs']
-                        old_log_probs_e = batch.batch['old_log_probs_e']
-                        entropy_factor =  torch.exp(old_log_probs - old_log_probs)
-                        true_ratio = (batch.batch["bool_reward"]==1).sum() / len(batch)
-                        print("batch.batch['bool_reward'].shape:", batch.batch['bool_reward'].shape)
-                        alpha = 0.1 / true_ratio
-                        # alpha = 0.2
-                        alpha = alpha / (alpha + 1)
-                        #batch.batch["advantages"] = (1-alpha) * batch.batch["advantages"] + alpha * batch.batch["bool_reward"].to(batch.batch["advantages"].dtype).unsqueeze(1) * entropy_factor
-                        batch.batch["advantages"] = batch.batch["bool_reward"].to(batch.batch["advantages"].dtype).unsqueeze(1) * entropy_factor
-                        self._compute_ref_log_probs(batch, timing_raw)
-                        self._update_critic(batch, timing_raw, metrics)
-                        self._update_actor(batch, timing_raw, metrics)
                     elif alg=="REINFORCE":  
                         _compute_bool_reward_by_score(batch, threshold = 0.05, absolute=False)
                         self._compute_old_log_probs(batch, timing_raw)
@@ -1224,29 +1241,6 @@ class RayPPOTrainer:
                         self._update_critic(batch, timing_raw, metrics)
                         self._update_actor(batch, timing_raw, metrics)
                     elif alg=="GRPO":                   
-                        self._compute_old_log_probs(batch, timing_raw)
-                        self._compute_ref_log_probs(batch, timing_raw)
-                        self._update_critic(batch, timing_raw, metrics)
-                        self._update_actor(batch, timing_raw, metrics)
-                    elif alg=="short-GRPO-tmp":  
-                        # 截取简短回答的GRPO版本
-                        
-                        logits = self.actor_rollout_wg.compute_logits(batch)
-                        batch = batch.union(logits)
-
-                        model_inputs = {**batch.batch, **batch.non_tensor_batch}
-                        responses = model_inputs["responses"]
-                        response_length = responses.size(1)
-                        attention_mask = model_inputs["attention_mask"]
-                        response_mask = attention_mask[:, -response_length:]
-                        logits = model_inputs["logits"]
-                        advantages = model_inputs["advantages"]
-                        self.apply_eos_boost_and_early_stop(
-                            model_inputs,
-                            meta_info=batch.meta_info,
-                            response_length=response_length,
-                            pad_to_length=response_length,
-                        )
                         self._compute_old_log_probs(batch, timing_raw)
                         self._compute_ref_log_probs(batch, timing_raw)
                         self._update_critic(batch, timing_raw, metrics)
