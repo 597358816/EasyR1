@@ -13,9 +13,12 @@ python3 -m verl.trainer.main \
     data.format_prompt="${FORMAT_PROMPT}" \
     worker.actor.model.model_path=${MODEL_PATH} \
     trainer.project_name=ReplayEntropy \
-    trainer.experiment_name=EFRame-1.15-2-wl \
+    trainer.experiment_name=KL-cov \
     worker.actor.micro_batch_size_per_device_for_update=2 \
     worker.actor.micro_batch_size_per_device_for_experience=4 \
-    trainer.save_freq=5 \
+    trainer.save_freq=10 \
+    trainer.save_freq=12 \
     trainer.total_episodes=20 \
     trainer.n_gpus_per_node=8 \
+    worker.actor.use_entropy_loss=true \
+    worker.actor.entropy_coef=0.01

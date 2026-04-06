@@ -138,23 +138,6 @@ def compute_gae_advantage_return(
 def compute_grpo_outcome_advantage(
     token_level_rewards: torch.Tensor, response_mask: torch.Tensor, index: torch.Tensor, eps: float = 1e-6
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Compute advantage for GRPO, operating only on Outcome reward
-    (with only one scalar reward for each response).
-
-    Args:
-        token_level_rewards: `(torch.Tensor)`
-            shape: (bs, response_length)
-        response_mask: `(torch.Tensor)`
-            shape: (bs, response_length)
-
-    Returns:
-        advantages: `(torch.Tensor)`
-            shape: (bs, response_length)
-        returns: `(torch.Tensor)`
-            shape: (bs, response_length)
-
-    """
     scores = token_level_rewards.sum(dim=-1)
     id2score = defaultdict(list)
     id2mean, id2std = {}, {}
@@ -297,41 +280,10 @@ def compute_policy_loss(
     clip_ratio_high: float,
     clip_ratio_dual: float,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute the policy loss.
 
-    Adapted from https://github.com/huggingface/trl/blob/v0.15.0/trl/trainer/ppo_trainer.py#L568
-
-    Args:
-        old_log_prob: `(torch.Tensor)`
-            shape: (bs, response_length)
-        log_prob: `(torch.Tensor)`
-            shape: (bs, response_length)
-        advantages: `(torch.Tensor)`
-            shape: (bs, response_length)
-        response_mask: `(torch.Tensor)`
-            shape: (bs, response_length)
-        clip_ratio_low: (float)
-            The lower clip range used in PPO. See https://arxiv.org/abs/1707.06347
-        clip_ratio_high: (float)
-            The higher clip range used in DAPO. See https://arxiv.org/pdf/2503.14476
-        clip_ratio_dual: (float)
-            The dual clip range used in Dual-clip PPO. See https://arxiv.org/pdf/1912.09729
-
-    Returns:
-        pg_loss: `a scalar torch.Tensor`
-            policy gradient loss computed via PPO
-        pg_clipfrac_higher: (float)
-            a float number indicating the fraction of policy gradient loss being clipped to a higher value
-        pg_clipfrac_lower: (float)
-            a float number indicating the fraction of policy gradient loss being clipped to a lower value
-        ppo_kl: (float)
-            a float number indicating the mean KL divergence between the old policy and the new policy
-
-    """
     negative_approx_kl = log_probs - old_log_probs
     negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
-    # clamp the ratio before exp to avoid nan
-    # see: https://github.com/pytorch/pytorch/issues/10729
+
     
     
     #inverse_old_probs = 1/torch.exp(old_log_probs)
@@ -350,13 +302,13 @@ def compute_policy_loss(
             max = np.log(1.0 + clip_ratio_high)
         )
     )
-    #clipped_ratio = torch.exp(
+    # clipped_ratio = torch.exp(
     #   torch.clamp(
     #       negative_approx_kl, 
-    #       min = np.log(1.0 - clip_ratio_low) + negative_approx_kl-negative_approx_kl.detach(),
-    #       max = np.log(1.0 + clip_ratio_high)+ torch.zeros_like(negative_approx_kl)
+    #       min = np.log(1.0 - clip_ratio_low) + negative_approx_kl - negative_approx_kl.detach(),
+    #       max = np.log(1.0 + clip_ratio_high) + negative_approx_kl - negative_approx_kl.detach()
     #   )
-    #)
+    # )
 
     pg_loss = -advantages * ratio
     pg_loss2 = -advantages * clipped_ratio
@@ -368,8 +320,47 @@ def compute_policy_loss(
     pg_clipfrac_lower = ((pg_loss < pg_loss2) & (advantages < 0)).float()
     
     clipped_pg_loss_lower = torch.min(clipped_pg_loss_higher, pg_loss3)  # clip if pg_loss > pg_loss3 and adv < 0
-    final_pg_loss = torch.where(advantages < 0, clipped_pg_loss_lower, clipped_pg_loss_higher)
+    final_pg_loss_tokens = torch.where(advantages < 0, clipped_pg_loss_lower, clipped_pg_loss_higher)
     #pg_clipfrac_lower = (clipped_pg_loss_higher > pg_loss3).float() * (advantages < 0).float()
+
+    # method = "kl_cov"
+    # kl_cov_ratio = 0.0002
+    # kl_coef = 1.0,
+    # if method == "kl_cov":
+    #     # valid tokens
+    #     valid = response_mask.bool()
+    #     n_valid = int(valid.sum().item())
+    #     if n_valid > 0:
+    #         flat_valid_idx = valid.reshape(-1).nonzero(as_tuple=False).squeeze(-1)
+    #         adv_v  = advantages.detach().float().reshape(-1)[flat_valid_idx]
+    #         logp_v = log_probs.detach().float().reshape(-1)[flat_valid_idx]
+    #         cov = (adv_v - adv_v.mean()) * (logp_v - logp_v.mean())  # [N]
+    #         if kl_cov_ratio < 1.0:
+    #             k = max(1, int(cov.numel() * kl_cov_ratio))
+    #         else:
+    #             k = min(int(kl_cov_ratio), cov.numel())
+    #         if k > 0:
+    #             topk_in_valid = torch.topk(cov, k, largest=True).indices
+    #             sel_flat_idx = flat_valid_idx[topk_in_valid]  # indices in [B*T]
+    #             kl_penalty = (log_probs - old_log_probs).abs()  # [B,T]
+    #             flat_loss = final_pg_loss_tokens.reshape(-1)
+    #             flat_kl   = kl_penalty.reshape(-1)
+
+    #             sel_flat_idx = sel_flat_idx.to(device=flat_loss.device, dtype=torch.long).flatten()
+
+    #             # 强制 kl_coef 为标量 tensor（避免 kl_coef 是 list/tuple 时触发 Python 序列乘法）
+    #             kl_coef_t = torch.as_tensor(kl_coef, device=flat_loss.device, dtype=flat_loss.dtype)
+    #             if kl_coef_t.numel() != 1:
+    #                 # 如果误传了 list/array，取均值压成标量（也可以改成 raise）
+    #                 kl_coef_t = kl_coef_t.mean()
+
+    #             src = flat_kl.index_select(0, sel_flat_idx) * kl_coef_t  # [k]
+
+    #             flat_loss = flat_loss.clone()
+    #             flat_loss.index_add_(0, sel_flat_idx, src)
+
+    #             final_pg_loss_tokens = flat_loss.reshape_as(final_pg_loss_tokens)
+
     
     # version of dr.grpo
     '''
@@ -389,7 +380,7 @@ def compute_policy_loss(
     '''
     
     # version of dapo
-    final_pg_loss = VF.masked_mean(final_pg_loss, response_mask)
+    final_pg_loss = VF.masked_mean(final_pg_loss_tokens, response_mask)
     pg_clipfrac_higher = VF.masked_mean(pg_clipfrac_higher, response_mask)
     pg_clipfrac_lower = VF.masked_mean(pg_clipfrac_lower, response_mask)
     ppo_kl = VF.masked_mean(-negative_approx_kl, response_mask)

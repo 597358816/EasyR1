@@ -75,6 +75,8 @@ class FunctionRewardManager:
         
     def __call__(self, data: DataProto) -> Tuple[torch.Tensor, Dict[str, List[float]]]:
         reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
+        length_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
+        accuracy_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
         reward_metrics = defaultdict(list)
         n = 8
         group = []
@@ -89,20 +91,33 @@ class FunctionRewardManager:
             )
             ground_truth = data_item.non_tensor_batch["ground_truth"]
             score = self.score_fn(response_str, ground_truth)
+
             if self.config.length_reward == "LP1":
-                length_min=6144
-                length_max=8192
-                if len(response_str) >= length_min:
-                   score["overall"] -= 0.5 * (len(response_str) - length_min) / (length_max-length_min)
+                length_min = 4096
+                length_max = 8192
+                length_reward = 0.0
+                if valid_response_length >= length_min:
+                    length_reward = -0.5 * (valid_response_length - length_min) / (length_max - length_min)
+                score["length"] = float(length_reward)
+                score["overall"] = float(score["overall"]) + float(length_reward)
                 reward_tensor[i, valid_response_length - 1] = score["overall"]
+                length_tensor[i, valid_response_length - 1] = score["length"]
+                accuracy_tensor[i, valid_response_length - 1] = float(score["accuracy"])
                 for key, value in score.items():
-                    reward_metrics[key].append(value)
+                    reward_metrics[key].append(float(value))
             elif self.config.length_reward == "LP2": 
                 lp2_weight = 1.0
                 correct01 = 1 if float(score["overall"]) > 0.5 else 0 
                 group.append((i, valid_response_length, score, correct01)) 
                 if len(group) == n: 
                     self._flush_group_lp2(group, reward_tensor, reward_metrics, lp2_weight)
+                continue
+            elif self.config.length_reward == "LP22": 
+                lp2_weight = 1.0
+                correct01 = 1 if float(score["overall"]) > 0.5 else 0 
+                group.append((i, valid_response_length, score, correct01)) 
+                if len(group) == n: 
+                    self._flush_group_lp22(group, reward_tensor, reward_metrics, length_tensor, accuracy_tensor, lp2_weight)
                 continue
             elif self.config.length_reward == "ShorterBetter":
                 sb_alpha = 1.0
@@ -141,10 +156,11 @@ class FunctionRewardManager:
                 continue
             else:                       
                 reward_tensor[i, valid_response_length - 1] = score["overall"]
+                accuracy_tensor[i, valid_response_length - 1] = float(score["accuracy"])
                 for key, value in score.items():
                     reward_metrics[key].append(value)
 
-        return reward_tensor, reward_metrics
+        return reward_tensor, reward_metrics, length_tensor, accuracy_tensor
     def _find_subseq(self, haystack, needle):
         """Return start idx of needle in haystack, else -1. Both are Python lists[int]."""
         if not needle or len(needle) > len(haystack):
@@ -362,6 +378,35 @@ class FunctionRewardManager:
                 reward_metrics[key].append(float(value))
         group.clear()
         return group
+
+    def _flush_group_lp22(self, group, reward_tensor, reward_metrics, length_tensor, accuracy_tensor, lp2_weight: float):
+        if not group:
+            return group
+        lens = [g[1] for g in group]
+        min_len = min(lens)
+        max_len = max(lens)
+        if max_len == min_len:
+            len_rewards = [0.0] * len(group)
+        else:
+            denom = float(max_len - min_len)
+            len_rewards = []
+            for (_, l, _, correct01) in group:
+                lam = 0.5 - (float(l - min_len) / denom)  # in [-0.5, 0.5]
+                if correct01 == 1:
+                    lr = lam
+                else:
+                    lr = min(0.0, lam) 
+                len_rewards.append(lr)
+        for (idx, valid_len, score, _), lr in zip(group, len_rewards): 
+            score["length"] = lp2_weight * float(lr) 
+            score["overall"] = float(score["overall"]) + lp2_weight * float(lr) 
+            reward_tensor[idx, valid_len - 1] = score["overall"] 
+            length_tensor[idx, valid_len - 1] = score["length"] 
+            accuracy_tensor[idx, valid_len - 1] = score["accuracy"]
+            for key, value in score.items(): 
+                reward_metrics[key].append(float(value))
+        group.clear()
+        return group
     
     def _flush_group_shorterbetter(
         self,
@@ -389,7 +434,6 @@ class FunctionRewardManager:
 
             sb_reward = float(alpha) * float(correct01) - float(beta) * abs(float(valid_len) - float(sol_len))
 
-            # 如果你想“完全按 ShorterBetter”，就覆盖 overall：
             score["overall"] = float(sb_reward)
             reward_tensor[idx, valid_len - 1] = float(score["overall"])
             for k, v in score.items():
