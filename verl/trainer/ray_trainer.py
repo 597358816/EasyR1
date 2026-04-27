@@ -781,22 +781,34 @@ class RayPPOTrainer:
             batch.batch["token_level_scores"] = reward_tensor
             batch.batch["acc_scores"] = accuracy_tensor
             batch.batch["len_scores"] = length_tensor
+
             reward_metrics = {
                 f"reward/{key}": value for key, value in reduce_metrics(reward_metrics).items()
             }
             metrics.update(reward_metrics)
+
             group_n = self.config.worker.rollout.n
-            
+
+            def _to_sample_scores(x):
+                """
+                Convert token-level reward tensor to per-sample scalar scores.
+                If x is already [B], return directly.
+                If x is [B, T], sum over T.
+                """
+                if x.dim() == 1:
+                    return x.float()
+                return x.sum(dim=-1).float()
+
             def _mean_group_var(token_level_rewards):
-                scores = token_level_rewards.sum(dim=-1).float()   # [B]
+                scores = _to_sample_scores(token_level_rewards)   # [B]
                 B = scores.shape[0]
                 assert B % group_n == 0, f"Batch size {B} is not divisible by group_n {group_n}"
                 scores = scores.view(B // group_n, group_n)
                 return scores.var(dim=1, unbiased=False).mean().item()
-            
+
             def _mean_group_cov(x_token_level_rewards, y_token_level_rewards):
-                x = x_token_level_rewards.sum(dim=-1).float()   # [B]
-                y = y_token_level_rewards.sum(dim=-1).float()   # [B]
+                x = _to_sample_scores(x_token_level_rewards)   # [B]
+                y = _to_sample_scores(y_token_level_rewards)   # [B]
                 B = x.shape[0]
                 assert B % group_n == 0, f"Batch size {B} is not divisible by group_n {group_n}"
                 x = x.view(B // group_n, group_n)  # [num_groups, group_n]
@@ -805,10 +817,10 @@ class RayPPOTrainer:
                 y_centered = y - y.mean(dim=1, keepdim=True)
                 cov = (x_centered * y_centered).mean(dim=1)  # unbiased=False
                 return cov.mean().item()
-            
+
             def _mean_group_corr(x_token_level_rewards, y_token_level_rewards, eps=1e-8):
-                x = x_token_level_rewards.sum(dim=-1).float()   # [B]
-                y = y_token_level_rewards.sum(dim=-1).float()   # [B]
+                x = _to_sample_scores(x_token_level_rewards)   # [B]
+                y = _to_sample_scores(y_token_level_rewards)   # [B]
                 B = x.shape[0]
                 assert B % group_n == 0, f"Batch size {B} is not divisible by group_n {group_n}"
                 x = x.view(B // group_n, group_n)
@@ -821,13 +833,89 @@ class RayPPOTrainer:
                 corr = cov / (std_x * std_y + eps)
                 return corr.mean().item()
 
-            # metrics["reward_var/reward"] = _mean_group_var(reward_tensor)
-            # var = True
-            # if var:
-            #     metrics["reward_var/accuracy"] = _mean_group_var(accuracy_tensor)
-            #     metrics["reward_var/length"] = _mean_group_var(length_tensor)
-            #     metrics["reward_var/acc_length_cov"] = _mean_group_cov(accuracy_tensor, length_tensor)
-            #     metrics["reward_var/acc_length_corr"] = _mean_group_corr(accuracy_tensor, length_tensor)
+            def _batch_cov_from_scores(x_scores, y_scores):
+                """
+                x_scores, y_scores: [B]
+                """
+                x = x_scores.float()
+                y = y_scores.float()
+                x_centered = x - x.mean()
+                y_centered = y - y.mean()
+                cov = (x_centered * y_centered).mean()   # unbiased=False
+                return cov.item()
+
+            def _batch_corr_from_scores(x_scores, y_scores, eps=1e-8):
+                """
+                x_scores, y_scores: [B]
+                """
+                x = x_scores.float()
+                y = y_scores.float()
+                x_centered = x - x.mean()
+                y_centered = y - y.mean()
+                cov = (x_centered * y_centered).mean()
+                std_x = x_centered.pow(2).mean().sqrt()
+                std_y = y_centered.pow(2).mean().sqrt()
+                corr = cov / (std_x * std_y + eps)
+                return corr.item()
+
+            def _mean_group_cov_from_scores(x_scores, y_scores):
+                """
+                x_scores, y_scores: [B]
+                Compute covariance within each group, then average over groups.
+                """
+                x = x_scores.float()
+                y = y_scores.float()
+                B = x.shape[0]
+                assert B % group_n == 0, f"Batch size {B} is not divisible by group_n {group_n}"
+
+                x = x.view(B // group_n, group_n)  # [num_groups, group_n]
+                y = y.view(B // group_n, group_n)
+
+                x_centered = x - x.mean(dim=1, keepdim=True)
+                y_centered = y - y.mean(dim=1, keepdim=True)
+                cov = (x_centered * y_centered).mean(dim=1)  # [num_groups]
+                return cov.mean().item()
+
+            def _mean_group_corr_from_scores(x_scores, y_scores, eps=1e-8):
+                """
+                x_scores, y_scores: [B]
+                Compute correlation within each group, then average over groups.
+                """
+                x = x_scores.float()
+                y = y_scores.float()
+                B = x.shape[0]
+                assert B % group_n == 0, f"Batch size {B} is not divisible by group_n {group_n}"
+
+                x = x.view(B // group_n, group_n)
+                y = y.view(B // group_n, group_n)
+
+                x_centered = x - x.mean(dim=1, keepdim=True)
+                y_centered = y - y.mean(dim=1, keepdim=True)
+
+                cov = (x_centered * y_centered).mean(dim=1)
+                std_x = x_centered.pow(2).mean(dim=1).sqrt()
+                std_y = y_centered.pow(2).mean(dim=1).sqrt()
+                corr = cov / (std_x * std_y + eps)
+                return corr.mean().item()
+
+            metrics["reward_var/reward"] = _mean_group_var(reward_tensor)
+
+            var = True
+            if var:
+                metrics["reward_var/accuracy"] = _mean_group_var(accuracy_tensor)
+                metrics["reward_var/length"] = _mean_group_var(length_tensor)
+                # 保留原来的：长度奖励 vs 准确性奖励（group级）
+                metrics["reward_var/acc_length_cov"] = _mean_group_cov(accuracy_tensor, length_tensor)
+                metrics["reward_var/acc_length_corr"] = _mean_group_corr(accuracy_tensor, length_tensor)
+                # 新增：真实 response length vs 准确性奖励
+                resp_lens = self._get_resp_lens(batch).float()   # [B]
+                acc_scores = _to_sample_scores(accuracy_tensor) # [B]
+                # batch级
+                metrics["reward_var/acc_raw_length_cov_batch"] = _batch_cov_from_scores(resp_lens, acc_scores)
+                metrics["reward_var/acc_raw_length_corr_batch"] = _batch_corr_from_scores(resp_lens, acc_scores)
+                # group级
+                metrics["reward_var/acc_raw_length_cov_group"] = _mean_group_cov_from_scores(resp_lens, acc_scores)
+                metrics["reward_var/acc_raw_length_corr_group"] = _mean_group_corr_from_scores(resp_lens, acc_scores)
                 
 
     def _compute_old_log_probs(self, batch: DataProto, timing_raw, temperature = None, eos_args = None):
@@ -896,7 +984,7 @@ class RayPPOTrainer:
             return torch.zeros(
                 len(dp),
                 dtype=torch.long,
-                device=dp.batch["advantages"].device if "advantages" in dp.batch else batch_bak.batch["attention_mask"].device,
+                device=dp.batch["advantages"].device
             )
 
 
@@ -982,10 +1070,10 @@ class RayPPOTrainer:
 
 
                     
-                    alg = "AEPO"
+                    alg = "ICR"
                     entropy_base = 0.5
-                    # if (self.global_step>151):
-                    #     print(exit1)
+                    if (self.global_step>162):
+                        print(exit1)
                     if alg=="AEPO":
                         delta = entropy_base - entropy   # entropy 小时 delta > 0，升温；反之降温
                         temperature = 1.0 - delta
@@ -1023,48 +1111,8 @@ class RayPPOTrainer:
                         self._update_critic(entropy_batch, timing_raw, metrics)
                         self._update_actor(entropy_batch, timing_raw, metrics) 
 
-                    elif alg=="AEPO-analyze":
-                        # delta = entropy_base - entropy   # entropy 小时 delta > 0，升温；反之降温
-                        temperature = 0.8
-                        sample_num = 60
-                        gen_batch_bak = gen_batch_bak[:len(gen_batch_bak) // 1]
-                        gen_batch_bak.meta_info["temperature"] = temperature
-                        
-                        with _timer("gen", timing_raw):  
-                            gen_batch_output_bak = self.actor_rollout_wg.generate_sequences(gen_batch_bak)
 
-                        batch_bak = batch_bak[:len(batch_bak) // 1].union(gen_batch_output_bak)
-                        self._compute_reward(batch_bak, timing_raw, metrics)
-                        batch_bak.meta_info["global_token_num"] = torch.sum(batch_bak.batch["attention_mask"], dim=-1).tolist()
-                        self._compute_values(batch_bak, timing_raw)
-                        self._compute_adv(batch_bak, timing_raw)
-                        count_occurrences(batch_bak, "advantages")
-
-                        entropy_controller = _select_by_advantage(batch_bak, threshold=0.05, absolute=True)
-                        num_ctrl = len(entropy_controller)
-                        if num_ctrl == 0:
-                            print("No samples selected by advantage threshold!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!.")
-                            entropy_controller = batch_bak[:sample_num]
-                        elif num_ctrl < sample_num:
-                            repeat_times = sample_num // num_ctrl
-                            remainder = sample_num % num_ctrl
-                            parts = []
-                            for _ in range(repeat_times):
-                                parts.append(entropy_controller[:num_ctrl])
-                            if remainder > 0:
-                                parts.append(entropy_controller[:remainder])
-                            entropy_controller = DataProto.concat(parts)
-                        else:
-                            entropy_controller = entropy_controller[:sample_num]
-                        # entropy_controller.batch["advantages"] = torch.ones_like(entropy_controller.batch["advantages"])
-                        entropy_batch = DataProto.concat([entropy_controller, batch[sample_num:]])
-                        self._compute_old_log_probs(entropy_batch, timing_raw)
-                        self._compute_ref_log_probs(entropy_batch, timing_raw)
-                        self._update_critic(entropy_batch, timing_raw, metrics)
-                        self._update_actor(entropy_batch, timing_raw, metrics) 
-
-
-                    elif alg == "AEPO-short4":
+                    elif alg == "ICR":
                         B = len(batch)
                         device = batch.batch["attention_mask"].device
                         group_n = int(self.config.worker.rollout.n)
@@ -1088,13 +1136,78 @@ class RayPPOTrainer:
 
                         k = int(sel_idx.numel())
                         if k > 0:
-                            bonus = torch.tensor(32.0 / float(k), device=device, dtype=adv.dtype)
+                            bonus = torch.tensor(128.0 / float(k), device=device, dtype=adv.dtype)
                             adv[sel_idx, :] += bonus
                             # adv[sel_idx, :] = (1+bonus) * adv[sel_idx, :]                     # 消融
                             metrics["response_length/select_num"] = k
                             metrics["response_length/pos_len"] = lens[sel_idx].mean().detach().item()
                         else:
                             metrics["response_length/select_num"] = 0
+                        batch.batch["advantages"] = adv
+
+                        self._compute_old_log_probs(batch, timing_raw)
+                        self._compute_ref_log_probs(batch, timing_raw)
+                        self._update_critic(batch, timing_raw, metrics)
+                        self._update_actor(batch, timing_raw, metrics)
+                    
+                    elif alg == "ICR_neg":
+                        B = len(batch)
+                        device = batch.batch["attention_mask"].device
+                        group_n = int(self.config.worker.rollout.n)
+                        lens = self._get_resp_lens(batch).to(torch.float32)
+
+                        num_groups = B // group_n
+                        lens_g = lens.view(num_groups, group_n)                 # [G, n]
+
+                        # 每组直接选择长度最短的样本，不区分正负样本
+                        _, min_pos = lens_g.min(dim=1)                          # [G]
+                        g_idx = torch.arange(num_groups, device=device, dtype=torch.long)
+                        sel_idx = g_idx * group_n + min_pos.to(torch.long)      # [G]
+
+                        adv = batch.batch["advantages"]                         # [B, D]
+
+                        k = int(sel_idx.numel())
+                        if k > 0:
+                            bonus = torch.tensor(64.0 / float(k), device=device, dtype=adv.dtype)
+
+                            # 用样本自身 advantage 的符号判断：
+                            # 正优势 +bonus，负优势 -bonus，零优势不动
+                            sel_adv_scalar = adv[sel_idx, :].mean(dim=1)        # [k]
+                            sign = torch.sign(sel_adv_scalar).to(adv.dtype)     # [k], in {-1,0,1}
+
+                            adv[sel_idx, :] += sign.unsqueeze(1) * bonus
+
+                            metrics["response_length/select_num"] = k
+                            metrics["response_length/selected_len"] = lens[sel_idx].mean().detach().item()
+                            metrics["response_length/selected_adv"] = sel_adv_scalar.mean().detach().item()
+                        else:
+                            metrics["response_length/select_num"] = 0
+
+                        batch.batch["advantages"] = adv
+
+                        self._compute_old_log_probs(batch, timing_raw)
+                        self._compute_ref_log_probs(batch, timing_raw)
+                        self._update_critic(batch, timing_raw, metrics)
+                        self._update_actor(batch, timing_raw, metrics)
+                    
+                    elif alg == "ICR_all":
+                        B = len(batch)
+                        device = batch.batch["attention_mask"].device
+                        lens = self._get_resp_lens(batch).to(torch.float32)
+
+                        adv = batch.batch["advantages"]                         # [B, D]
+
+                        sel_idx = torch.arange(B, device=device, dtype=torch.long)
+                        k = int(sel_idx.numel())
+
+                        if k > 0:
+                            bonus = torch.tensor(64.0 / float(k), device=device, dtype=adv.dtype)
+                            adv[sel_idx, :] += bonus
+                            metrics["response_length/select_num"] = k
+                            metrics["response_length/selected_len"] = lens[sel_idx].mean().detach().item()
+                        else:
+                            metrics["response_length/select_num"] = 0
+
                         batch.batch["advantages"] = adv
 
                         self._compute_old_log_probs(batch, timing_raw)

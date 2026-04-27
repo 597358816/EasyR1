@@ -99,7 +99,7 @@ class FunctionRewardManager:
                 if valid_response_length >= length_min:
                     length_reward = -0.5 * (valid_response_length - length_min) / (length_max - length_min)
                 score["length"] = float(length_reward)
-                score["overall"] = float(score["overall"]) + float(length_reward)
+                score["overall"] = float(score["overall"]) #+ float(length_reward)
                 reward_tensor[i, valid_response_length - 1] = score["overall"]
                 length_tensor[i, valid_response_length - 1] = score["length"]
                 accuracy_tensor[i, valid_response_length - 1] = float(score["accuracy"])
