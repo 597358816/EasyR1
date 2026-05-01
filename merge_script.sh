@@ -1,5 +1,5 @@
 MODEL_NAME="Qwen3-4B"
-RUN_NAME="qwen3-4b-ICR-ab-all"
+RUN_NAME="qwen3-4b-ICR-ab-neg2"
 
 #for step in $(seq 200 10 270)
 #for step in $(seq 50 10 120)

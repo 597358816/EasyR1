@@ -1070,7 +1070,7 @@ class RayPPOTrainer:
 
 
                     
-                    alg = "ICR"
+                    alg = "ICR_neg"
                     entropy_base = 0.5
                     if (self.global_step>162):
                         print(exit1)
@@ -1138,6 +1138,7 @@ class RayPPOTrainer:
                         if k > 0:
                             bonus = torch.tensor(128.0 / float(k), device=device, dtype=adv.dtype)
                             adv[sel_idx, :] += bonus
+                            # adv[sel_idx, :] = bonus                                            # 消融
                             # adv[sel_idx, :] = (1+bonus) * adv[sel_idx, :]                     # 消融
                             metrics["response_length/select_num"] = k
                             metrics["response_length/pos_len"] = lens[sel_idx].mean().detach().item()
