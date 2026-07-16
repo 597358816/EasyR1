@@ -61,6 +61,7 @@ class Role(IntEnum):
     Critic = auto()
     RefPolicy = auto()
     RewardModel = auto()
+    Teacher = auto()
     ActorRolloutRef = auto()
 
 
@@ -393,6 +394,10 @@ class RayPPOTrainer:
             self.use_reference_policy = False
             self.kl_ctrl = core_algos.FixedKLController(init_kl_coef=0.0)
             print("KL is disabled, no KL metrics will be logged. Please set `kl_coef=0` to log KL metrics.")
+        self.use_teacher_policy = (
+            self.config.worker.teacher.use_teacher
+            and Role.Teacher in role_worker_mapping
+        )
 
         if config.algorithm.adv_estimator == AdvantageEstimator.GAE:
             self.use_critic = True
@@ -604,6 +609,15 @@ class RayPPOTrainer:
             )
             self.resource_pool_to_cls[resource_pool]["ref"] = ref_policy_cls
 
+        if self.use_teacher_policy:
+            resource_pool = self.resource_pool_manager.get_resource_pool(Role.Teacher)
+            teacher_policy_cls = RayClassWithInitArgs(
+                self.role_worker_mapping[Role.Teacher],
+                config=self.config.worker,
+                role="teacher",
+            )
+            self.resource_pool_to_cls[resource_pool]["teacher"] = teacher_policy_cls
+
         # create a reward model if reward_fn is None
         if self.use_reward_model:
             # we create a RM here
@@ -634,6 +648,10 @@ class RayPPOTrainer:
         if self.use_reference_policy:
             self.ref_policy_wg = all_wg["ref"]
             self.ref_policy_wg.init_model()
+            
+        if self.use_teacher_policy:
+            self.teacher_policy_wg = all_wg["teacher"]
+            self.teacher_policy_wg.init_model()
 
         if self.use_reward_model:
             self.rm_wg = all_wg["rm"]
@@ -900,7 +918,7 @@ class RayPPOTrainer:
 
             metrics["reward_var/reward"] = _mean_group_var(reward_tensor)
 
-            var = True
+            var = False
             if var:
                 metrics["reward_var/accuracy"] = _mean_group_var(accuracy_tensor)
                 metrics["reward_var/length"] = _mean_group_var(length_tensor)
@@ -939,6 +957,15 @@ class RayPPOTrainer:
                 ref_log_probs = self.ref_policy_wg.compute_ref_log_probs(batch)
                 batch = batch.union(ref_log_probs)
 
+    def _compute_teacher_log_probs(self, batch: DataProto, timing_raw):
+        if self.use_teacher_policy:
+            with _timer("teacher", timing_raw):
+                if "temperature" not in batch.meta_info:
+                    batch.meta_info["temperature"] = 1.0
+                teacher_log_probs = self.teacher_policy_wg.compute_teacher_log_probs(batch)
+                batch = batch.union(teacher_log_probs)
+        return batch
+
     def _compute_values(self, batch: DataProto, timing_raw):
         if self.use_critic:
             with _timer("values", timing_raw):
@@ -955,20 +982,6 @@ class RayPPOTrainer:
                 )
             else:
                 batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
-            #compute advantages, executed on the driver process
-            # print("compute advantage decoupled with reward, using token_level_scores and acc_scores")
-            # batch.batch["advantages"], batch.batch["returns"] = core_algos.compute_grpo_outcome_advantage(
-            #     batch.batch["acc_scores"],
-            #     batch.batch["response_mask"],
-            #     batch.non_tensor_batch["uid"]
-            # )
-            # len_adv, len_ret = core_algos.compute_grpo_outcome_advantage(
-            #     batch.batch["len_scores"],
-            #     batch.batch["response_mask"],
-            #     batch.non_tensor_batch["uid"]
-            # )
-            # batch.batch["advantages"] += len_adv
-            # batch.batch["returns"] += len_ret
             batch = compute_advantage(
                 batch,
                 adv_estimator=self.config.algorithm.adv_estimator,
@@ -986,7 +999,134 @@ class RayPPOTrainer:
                 dtype=torch.long,
                 device=dp.batch["advantages"].device
             )
+    def _apply_drl_importance_weight(
+        self,
+        batch: DataProto,
+        metrics: dict,
+        clip_ratio: float = 3.0,
+        rho_apply_to: str = "positive",  # "all", "positive", "negative"
+        if_normalized: bool = True,
+        temperature_as_teacher: bool = False
+    ):
+        old_log_probs = batch.batch["old_log_probs"]              # [B, T]
+        if temperature_as_teacher:
+            teacher_log_probs = batch.batch["old_log_probs_t"]    # [B, T] 
+        else:
+            teacher_log_probs = batch.batch["teacher_log_probs"]  # [B, T]
+        advantages = batch.batch["advantages"]                    # [B, T]
+        response_mask = batch.batch["response_mask"]              # [B, T]
 
+        valid_mask = response_mask.bool()
+        # token-level log rho: [B, T]
+        token_log_rho = teacher_log_probs - old_log_probs
+        # token-level raw rho: [B, T]
+        rho_raw = torch.exp(token_log_rho.clamp(min=-80.0, max=80.0))
+
+        clip_low = 1.0 / clip_ratio
+        clip_high = clip_ratio
+        # token-level clipped rho: [B, T]
+        rho_clipped = rho_raw.clamp(min=clip_low, max=clip_high)
+
+        if if_normalized:
+            eps = 1e-12
+            mask_float = valid_mask.to(rho_clipped.dtype)
+
+            # 在 log 空间计算每条 response 的平均 log-rho
+            log_rho_clipped = torch.log(rho_clipped.clamp_min(eps))
+
+            mean_log_rho_per_response = (
+                (log_rho_clipped * mask_float).sum(dim=-1, keepdim=True)
+                / mask_float.sum(dim=-1, keepdim=True).clamp_min(1.0)
+            )
+
+            # 除以每条 response 的 rho 几何均值
+            rho_clipped = torch.exp(
+                log_rho_clipped - mean_log_rho_per_response
+            )
+
+            # padding 位置保持权重为 1
+            rho_clipped = torch.where(
+                valid_mask,
+                rho_clipped,
+                torch.ones_like(rho_clipped),
+            )
+        # -------- choose where to apply rho --------
+        if rho_apply_to == "all":
+            apply_mask = valid_mask
+        elif rho_apply_to == "positive":
+            apply_mask = valid_mask & (advantages > 0)
+        elif rho_apply_to == "negative":
+            apply_mask = valid_mask & (advantages < 0)
+        else:
+            raise ValueError(
+                f"Unknown rho_apply_to={rho_apply_to}. "
+                "Expected one of: 'all', 'positive', 'negative'."
+            )
+
+        # positions not selected use weight 1.0
+        effective_rho = torch.ones_like(rho_clipped)
+        effective_rho = torch.where(apply_mask, rho_clipped, effective_rho)
+
+        # token-level reweighting
+        batch.batch["advantages"] = advantages * effective_rho
+
+        # -------- metrics --------
+        with torch.no_grad():
+            eps = 1e-12
+
+            valid_token_log_rho = token_log_rho[valid_mask].detach()
+            valid_rho_raw = rho_raw[valid_mask].detach()
+            valid_rho_clipped = rho_clipped[valid_mask].detach()
+
+            selected_rho = rho_clipped[apply_mask].detach()
+            selected_raw_rho = rho_raw[apply_mask].detach()
+
+            metrics["rho/apply_to"] = {"all": 0, "positive": 1, "negative": 2}[rho_apply_to]
+            metrics["rho/apply_frac"] = apply_mask.float().sum().item() / valid_mask.float().sum().clamp_min(1.0).item()
+
+            metrics["rho/token_rho_raw_min"] = valid_rho_raw.min().item()
+            metrics["rho/token_rho_raw_max"] = valid_rho_raw.max().item()
+            metrics["rho/token_rho_raw_mean"] = valid_rho_raw.mean().item()
+            metrics["rho/token_rho_raw_geomean"] = torch.exp(valid_token_log_rho.mean()).item()
+
+            metrics["rho/token_rho_clipped_min"] = valid_rho_clipped.min().item()
+            metrics["rho/token_rho_clipped_max"] = valid_rho_clipped.max().item()
+            metrics["rho/token_rho_clipped_mean"] = valid_rho_clipped.mean().item()
+            metrics["rho/token_rho_clipped_geomean"] = torch.exp(
+                torch.log(valid_rho_clipped.clamp_min(eps)).mean()
+            ).item()
+
+            metrics["rho/token_clip_low_frac"] = (valid_rho_raw < clip_low).float().mean().item()
+            metrics["rho/token_clip_high_frac"] = (valid_rho_raw > clip_high).float().mean().item()
+            metrics["rho/token_clip_frac"] = (
+                (valid_rho_raw < clip_low) | (valid_rho_raw > clip_high)
+            ).float().mean().item()
+
+            metrics["rho/token_log_rho_min"] = valid_token_log_rho.min().item()
+            metrics["rho/token_log_rho_max"] = valid_token_log_rho.max().item()
+            metrics["rho/token_log_rho_mean"] = valid_token_log_rho.mean().item()
+
+            # selected-only metrics
+            if selected_rho.numel() > 0:
+                metrics["rho/selected_rho_mean"] = selected_rho.mean().item()
+                metrics["rho/selected_rho_min"] = selected_rho.min().item()
+                metrics["rho/selected_rho_max"] = selected_rho.max().item()
+                metrics["rho/selected_clip_frac"] = (
+                    (selected_raw_rho < clip_low) | (selected_raw_rho > clip_high)
+                ).float().mean().item()
+            else:
+                metrics["rho/selected_rho_mean"] = 1.0
+                metrics["rho/selected_rho_min"] = 1.0
+                metrics["rho/selected_rho_max"] = 1.0
+                metrics["rho/selected_clip_frac"] = 0.0
+
+            # sequence-level log rho only for debugging, not used for clipping
+            seq_log_rho = (token_log_rho * response_mask.to(token_log_rho.dtype)).sum(dim=-1)
+            metrics["rho/seq_log_rho_min"] = seq_log_rho.detach().min().item()
+            metrics["rho/seq_log_rho_max"] = seq_log_rho.detach().max().item()
+            metrics["rho/seq_log_rho_mean"] = seq_log_rho.detach().mean().item()
+
+        return batch
 
     def fit(self):
         """
@@ -1069,191 +1209,19 @@ class RayPPOTrainer:
                         print("Failed to decode first response:", e)
 
 
-                    
-                    alg = "ICR_neg"
-                    entropy_base = 0.5
-                    if (self.global_step>162):
-                        print(exit1)
-                    if alg=="AEPO":
-                        delta = entropy_base - entropy   # entropy 小时 delta > 0，升温；反之降温
-                        temperature = 1.0 - delta
-                        temperature = max(0.8, min(1.2, temperature))
-                        # if entropy <= entropy_base:
-                        #     sample_num = 64
-                        # else:
-                        sample_num = 64
-                        print(f"entropy: {entropy:.4f}, temperature: {temperature:.4f}")
-                        metrics["temperature"] = temperature
-                        gen_batch_bak = gen_batch_bak[:len(gen_batch_bak) // 1]
-                        gen_batch_bak.meta_info["temperature"] = temperature
-                        
-                        with _timer("gen", timing_raw):  
-                            gen_batch_output_bak = self.actor_rollout_wg.generate_sequences(gen_batch_bak)
-                        batch_bak = batch_bak[:len(batch_bak) // 1].union(gen_batch_output_bak)   
-                        self._compute_reward(batch_bak, timing_raw, metrics)  
-                        batch_bak.meta_info["global_token_num"] = torch.sum(batch_bak.batch["attention_mask"], dim=-1).tolist()
-                        self._compute_values(batch_bak, timing_raw)
-                        self._compute_adv(batch_bak, timing_raw)        
-                        count_occurrences(batch_bak, "advantages")
-                        entropy_controller = _select_by_advantage_reverse(batch_bak, threshold = 0.05, absolute=False)
-                        sample_num = min(sample_num, len(entropy_controller))
-                        entropy_controller.batch["advantages"] = -1*torch.ones_like(entropy_controller.batch["advantages"])
-                        entropy_batch = DataProto.concat([entropy_controller[:sample_num], batch[sample_num:]])
-                        self._compute_old_log_probs(entropy_batch, timing_raw)
-                        # self._compute_old_log_probs(entropy_batch, timing_raw, temperature = temperature)
-                        # old_log_probs = entropy_batch.batch['old_log_probs']
-                        # old_log_probs_t = entropy_batch.batch['old_log_probs_t']
-                        
-                        #entropy_batch.batch["advantages"][:sample_num] = entropy_batch.batch["advantages"][:sample_num] * torch.exp(old_log_probs[:sample_num] - old_log_probs_t[:sample_num])
-                        #entropy_batch.batch['old_log_probs'][:sample_num] = old_log_probs_t[:sample_num]
-                        self._compute_ref_log_probs(entropy_batch, timing_raw)
-            
-                        self._update_critic(entropy_batch, timing_raw, metrics)
-                        self._update_actor(entropy_batch, timing_raw, metrics) 
-
-
-                    elif alg == "ICR":
-                        B = len(batch)
-                        device = batch.batch["attention_mask"].device
-                        group_n = int(self.config.worker.rollout.n)
-                        lens = self._get_resp_lens(batch).to(torch.float32)
-                        values = batch.batch["token_level_scores"].sum(dim=1)  # [B]
-                        pos_mask = values > 0                                  # [B] bool
-                        # pos_mask = torch.ones_like(pos_mask)                                  #消融 不区分正负样本了，直接选长度最短的
-                        num_groups = B // group_n
-                        lens_g = lens.view(num_groups, group_n)          # [G, n]
-                        pos_g  = pos_mask.view(num_groups, group_n)      # [G, n]
-                        cand = lens_g.masked_fill(~pos_g, float("inf"))  # [G, n]
-                        min_len, min_pos = cand.min(dim=1)               # [G], [G]
-                        valid_group = torch.isfinite(min_len)            # [G] bool
-                        if valid_group.any():
-                            g_idx = torch.arange(num_groups, device=device, dtype=torch.long)[valid_group]
-                            sel_idx = g_idx * group_n + min_pos[valid_group].to(torch.long)  # [k]
-                        else:
-                            sel_idx = torch.empty((0,), device=device, dtype=torch.long)
-
-                        adv = batch.batch["advantages"]  # [B, D]
-
-                        k = int(sel_idx.numel())
-                        if k > 0:
-                            bonus = torch.tensor(128.0 / float(k), device=device, dtype=adv.dtype)
-                            adv[sel_idx, :] += bonus
-                            # adv[sel_idx, :] = bonus                                            # 消融
-                            # adv[sel_idx, :] = (1+bonus) * adv[sel_idx, :]                     # 消融
-                            metrics["response_length/select_num"] = k
-                            metrics["response_length/pos_len"] = lens[sel_idx].mean().detach().item()
-                        else:
-                            metrics["response_length/select_num"] = 0
-                        batch.batch["advantages"] = adv
-
+                    alg = self.config.trainer.algorithm
+                    if alg=="Distilled-RL":                   
                         self._compute_old_log_probs(batch, timing_raw)
                         self._compute_ref_log_probs(batch, timing_raw)
-                        self._update_critic(batch, timing_raw, metrics)
-                        self._update_actor(batch, timing_raw, metrics)
-                    
-                    elif alg == "ICR_neg":
-                        B = len(batch)
-                        device = batch.batch["attention_mask"].device
-                        group_n = int(self.config.worker.rollout.n)
-                        lens = self._get_resp_lens(batch).to(torch.float32)
-
-                        num_groups = B // group_n
-                        lens_g = lens.view(num_groups, group_n)                 # [G, n]
-
-                        # 每组直接选择长度最短的样本，不区分正负样本
-                        _, min_pos = lens_g.min(dim=1)                          # [G]
-                        g_idx = torch.arange(num_groups, device=device, dtype=torch.long)
-                        sel_idx = g_idx * group_n + min_pos.to(torch.long)      # [G]
-
-                        adv = batch.batch["advantages"]                         # [B, D]
-
-                        k = int(sel_idx.numel())
-                        if k > 0:
-                            bonus = torch.tensor(64.0 / float(k), device=device, dtype=adv.dtype)
-
-                            # 用样本自身 advantage 的符号判断：
-                            # 正优势 +bonus，负优势 -bonus，零优势不动
-                            sel_adv_scalar = adv[sel_idx, :].mean(dim=1)        # [k]
-                            sign = torch.sign(sel_adv_scalar).to(adv.dtype)     # [k], in {-1,0,1}
-
-                            adv[sel_idx, :] += sign.unsqueeze(1) * bonus
-
-                            metrics["response_length/select_num"] = k
-                            metrics["response_length/selected_len"] = lens[sel_idx].mean().detach().item()
-                            metrics["response_length/selected_adv"] = sel_adv_scalar.mean().detach().item()
-                        else:
-                            metrics["response_length/select_num"] = 0
-
-                        batch.batch["advantages"] = adv
-
-                        self._compute_old_log_probs(batch, timing_raw)
-                        self._compute_ref_log_probs(batch, timing_raw)
-                        self._update_critic(batch, timing_raw, metrics)
-                        self._update_actor(batch, timing_raw, metrics)
-                    
-                    elif alg == "ICR_all":
-                        B = len(batch)
-                        device = batch.batch["attention_mask"].device
-                        lens = self._get_resp_lens(batch).to(torch.float32)
-
-                        adv = batch.batch["advantages"]                         # [B, D]
-
-                        sel_idx = torch.arange(B, device=device, dtype=torch.long)
-                        k = int(sel_idx.numel())
-
-                        if k > 0:
-                            bonus = torch.tensor(64.0 / float(k), device=device, dtype=adv.dtype)
-                            adv[sel_idx, :] += bonus
-                            metrics["response_length/select_num"] = k
-                            metrics["response_length/selected_len"] = lens[sel_idx].mean().detach().item()
-                        else:
-                            metrics["response_length/select_num"] = 0
-
-                        batch.batch["advantages"] = adv
-
-                        self._compute_old_log_probs(batch, timing_raw)
-                        self._compute_ref_log_probs(batch, timing_raw)
-                        self._update_critic(batch, timing_raw, metrics)
-                        self._update_actor(batch, timing_raw, metrics)
-
-                        
-                    elif alg=="DCPO":  
-                        temperature = 1          
-                        if entropy <= entropy_base:
-                            temperature = 1.2
-                        elif entropy > entropy_base:     
-                            temperature = 0.8   
-
-                        entropy_delta = entropy_base-entropy
-                        entropy_delta_list.append(entropy_delta)
-
-                        _compute_bool_reward_by_score(batch, threshold = 0.05, absolute=False)
-                        self._compute_old_log_probs(batch, timing_raw)
-                        self._compute_old_log_probs(batch, timing_raw, temperature = temperature)
-                    
-                        old_log_probs = batch.batch['old_log_probs']
-                        old_log_probs_t = batch.batch['old_log_probs_t']
-                        entropy_factor = torch.exp(old_log_probs_t - old_log_probs)
-                        true_ratio = (batch.batch["bool_reward"]==1).sum() / len(batch)
-                        print("batch.batch['bool_reward'].shape:", batch.batch['bool_reward'].shape)
-                        alpha = entropy_delta 
-                        metrics["alpha/alpha"] = alpha
-                        metrics["alpha/current"] = entropy_delta
-                        metrics["alpha/history"] = 0.01 * sum(entropy_delta_list)
-                        alpha = abs(alpha)
-                        alpha = min(alpha, 0.1)
-                        alpha = alpha / true_ratio
-                        alpha = alpha / (alpha + 1)
-                        batch.batch["advantages"] = (1-alpha) * batch.batch["advantages"] + alpha * batch.batch["bool_reward"].to(batch.batch["advantages"].dtype).unsqueeze(1) * entropy_factor
-                        self._compute_ref_log_probs(batch, timing_raw)
-                        self._update_critic(batch, timing_raw, metrics)
-                        self._update_actor(batch, timing_raw, metrics)
-                    elif alg=="REINFORCE":  
-                        _compute_bool_reward_by_score(batch, threshold = 0.05, absolute=False)
-                        self._compute_old_log_probs(batch, timing_raw)
-                        old_log_probs = batch.batch['old_log_probs']
-                        batch.batch["advantages"] = batch.batch["bool_reward"].to(batch.batch["advantages"].dtype).unsqueeze(1)
-                        self._compute_ref_log_probs(batch, timing_raw)
+                        self._compute_teacher_log_probs(batch, timing_raw)
+                        batch = self._apply_drl_importance_weight(
+                            batch=batch,
+                            metrics=metrics,
+                            clip_ratio=self.config.trainer.rho_clip,
+                            rho_apply_to=self.config.trainer.rho_sample,   # "all" / "positive" / "negative"
+                            if_normalized=self.config.trainer.rho_normalized,
+                            temperature_as_teacher=self.config.trainer.temperature_as_teacher,
+                        )
                         self._update_critic(batch, timing_raw, metrics)
                         self._update_actor(batch, timing_raw, metrics)
                     elif alg=="GRPO":                   
@@ -1261,171 +1229,7 @@ class RayPPOTrainer:
                         self._compute_ref_log_probs(batch, timing_raw)
                         self._update_critic(batch, timing_raw, metrics)
                         self._update_actor(batch, timing_raw, metrics)
-                    elif alg=="GRPO+REINFORCE":  
-                        _compute_bool_reward_by_score(batch, threshold = 0.05, absolute=False)
-                        self._compute_old_log_probs(batch, timing_raw)
-                        old_log_probs = batch.batch['old_log_probs']
-                        rate = 32 / sum(batch.batch["bool_reward"])
-                        batch.batch["advantages"] += rate * batch.batch["bool_reward"].to(batch.batch["advantages"].dtype).unsqueeze(1)
-                        self._compute_ref_log_probs(batch, timing_raw)
-                        self._update_critic(batch, timing_raw, metrics)
-                        self._update_actor(batch, timing_raw, metrics)
-                    elif alg=="entropy_adv":                   
-                        alpha = 0.4
-                        kappa = 2
-                        token_entropy = self.actor_rollout_wg.compute_entropy(batch).batch["entropy"]
-                        batch.batch["advantages"] += torch.min(alpha * token_entropy.detach(), batch.batch["advantages"].abs()/kappa)
-                        self._compute_old_log_probs(batch, timing_raw)
-                        self._compute_ref_log_probs(batch, timing_raw)
-                        self._update_critic(batch, timing_raw, metrics)
-                        self._update_actor(batch, timing_raw, metrics)
-                        
-                        
-                    elif alg=="DAPO":     
-                        if replay_buffer.capacity == 0:
-                            replay_buffer.capacity =  2 * initial_batch_size
-                        if batch_buffer.capacity == 0:
-                            batch_buffer.capacity = 4 * initial_batch_size      
-                        batch = _select_by_advantage(batch, threshold = 0.05)
-                        batch_buffer.add(batch)
 
-                        if batch_buffer.size >= initial_batch_size:
-                            batch = batch_buffer.pop((batch_buffer.size // initial_batch_size) * initial_batch_size)
-                            self._compute_old_log_probs(batch, timing_raw)
-                            self._compute_ref_log_probs(batch, timing_raw)
-                            high_advantage_batch = _select_by_advantage(batch, threshold = 1)
-
-                            print("final batch size is:", len(batch))
-                            self._update_critic(batch, timing_raw, metrics)
-                            self._update_actor(batch, timing_raw, metrics)
-                            replay_buffer.add(high_advantage_batch)
-                    elif alg=="UEC-RL":
-                        if replay_buffer.capacity == 0:
-                            replay_buffer.capacity =  2 * initial_batch_size
-                        if batch_buffer.capacity == 0:
-                            batch_buffer.capacity = 4 * initial_batch_size
-                        # select prompts
-                        count_occurrences(batch,"advantages")
-                        difficult_prompt_indices = _select_hard_prompts(batch, self.config.worker.rollout.n, difficult_record, 0.01)
-                        medium_advantage_batch = _select_by_advantage(batch, threshold = 0.05)
-                        gen_difficult_batch = gen_batch.select_by_index(difficult_prompt_indices)
-                        if len(gen_difficult_batch) % 32 > 0:
-                            gen_difficult_batch = duplicate_gen_batch(gen_difficult_batch, 32)
-
-                        temperature = 1.1
-                        rollout_n = 20
-                        gen_difficult_batch.meta_info["temperature"] = temperature
-                        gen_difficult_batch.meta_info["n"] = rollout_n
-                        
-                        # generate response for difficult prompts
-                        with _timer("gen", timing_raw):  
-                            gen_difficult_batch_output = self.actor_rollout_wg.generate_sequences(gen_difficult_batch)
-                        
-
-                        difficult_batch = initial_batch.select_by_index(difficult_prompt_indices)
-                        difficult_batch = duplicate_gen_batch(difficult_batch, 32)
-                        difficult_batch = difficult_batch.repeat(repeat_times = rollout_n, interleave=True)
-                        difficult_batch = difficult_batch.union(gen_difficult_batch_output)
-
-                        self._compute_reward(difficult_batch, timing_raw, metrics)
-                        difficult_batch.meta_info["global_token_num"] = torch.sum(difficult_batch.batch["attention_mask"], dim=-1).tolist()
-                        self._compute_values(difficult_batch, timing_raw)
-                        self._compute_adv(difficult_batch, timing_raw)
-#                         with torch.no_grad():
-#                             # 1) scalar reward per sample: 优先使用 token_level_scores.sum(dim=1)，否则尝试 rewards/scores
-#                             if "token_level_scores" in difficult_batch.batch:
-#                                 reward_scalar = difficult_batch.batch["token_level_scores"].sum(dim=1)
-#                             elif "rewards" in difficult_batch.batch:
-#                                 reward_scalar = difficult_batch.batch["rewards"]
-#                             elif "scores" in difficult_batch.batch:
-#                                 reward_scalar = difficult_batch.batch["scores"]
-#                             else:
-#                                 raise KeyError(
-#                                     "Cannot find reward tensor in difficult_batch.batch. "
-#                                     "Expected one of: token_level_scores / rewards / scores"
-#                                 )
-
-#                             # 正样本判定：reward > 0 视为正样本（按你之前的逻辑 values>0）
-#                             pos_mask = (reward_scalar > 0)
-
-#                             # 2) group by prompt (assume each prompt has rollout_n adjacent responses)
-#                             _rollout_n = rollout_n  # 这里 rollout_n = 40
-#                             _half = _rollout_n // 2  # 20
-
-#                             total_items = len(difficult_batch)
-#                             num_prompts = total_items // _rollout_n
-#                             valid_items = num_prompts * _rollout_n
-
-#                             if valid_items != total_items:
-#                                 print(f"[WARN] difficult_batch size {total_items} not divisible by rollout_n={_rollout_n}, "
-#                                       f"truncate to {valid_items} for stats.")
-
-#                             pos_mask = pos_mask[:valid_items].view(num_prompts, _rollout_n)  # [num_prompts, 40]
-
-#                             pos_first20 = pos_mask[:, :_half]          # [num_prompts, 20]
-#                             pos_last20  = pos_mask[:, _half:_rollout_n]# [num_prompts, 20]
-
-#                             solved_in_first20 = pos_first20.any(dim=1)  # [num_prompts]
-#                             solved_only_in_last20 = (~solved_in_first20) & (pos_last20.any(dim=1))
-
-#                             # 3) required stats
-#                             difficult_total = int(num_prompts)
-
-#                             solved_first20_cnt = int(solved_in_first20.sum().item())
-#                             # “对应的正样本数”：只统计这些“前20可解”的问题，在前20里出现的正样本总数
-#                             solved_first20_pos_cnt = int(pos_first20[solved_in_first20].sum().item())
-
-#                             harder_cnt = int(solved_only_in_last20.sum().item())
-#                             harder_pos_cnt = int(pos_last20[solved_only_in_last20].sum().item())
-#                             metrics["difficult/difficult_prompts"]=difficult_total
-#                             metrics["difficult/solvable_prompts"]=solved_first20_cnt
-#                             metrics["difficult/solvable_responses"]=solved_first20_pos_cnt
-#                             metrics["difficult/deeper_solvable_prompts"]=harder_cnt
-#                             metrics["difficult/deeper_solvable_responses"]=harder_pos_cnt
-#                             print(f"[EFRame][HardStats] difficult_prompts_total={difficult_total}")
-#                             print(f"[EFRame][HardStats] solved_in_first20={solved_first20_cnt}, pos_in_first20_for_those={solved_first20_pos_cnt}")
-#                             print(f"[EFRame][HardStats] solved_only_in_last20={harder_cnt}, pos_in_last20_for_those={harder_pos_cnt}")
-                            
-                            
-                        count_occurrences(difficult_batch, "advantages")
-                        difficult_batch = _select_by_advantage(difficult_batch, threshold = 0.5)
-                        
-                        # union final batch
-                        batch = DataProto.concat([difficult_batch, medium_advantage_batch])
-                        
-                        #_filtering_overlong(batch, overlong_record, overlong_positive_record)
-                        batch = _filtering_overlong(batch, overlong_record, overlong_positive_record)
-
-                        print("difficult prompt nums:", difficult_record)
-                        print("overlong_nums:", overlong_record)
-                        print("overlong_positive:", overlong_positive_record)
-                        batch_buffer.add(batch)
-                        if batch_buffer.size >= initial_batch_size:
-                            batch = batch_buffer.pop((batch_buffer.size // initial_batch_size) * initial_batch_size)
-                            self._balance_batch(batch, metrics)
-                            self._compute_old_log_probs(batch, timing_raw)
-                            self._compute_ref_log_probs(batch, timing_raw)
-                            high_advantage_batch = _select_by_advantage(batch, threshold = 1, absolute = False)
-                        
-                            print("final batch size is:", len(batch))
-                            self._update_critic(batch, timing_raw, metrics)
-                            self._update_actor(batch, timing_raw, metrics)
-                            replay_buffer.add(high_advantage_batch)
-                            print("replay_buffer size:", replay_buffer.size)
-                        
-                        # train using replay buffer
-                        if (self.global_step % 5 == 0 and replay_buffer.size // initial_batch_size > 0):
-                            print("start replay buffer")
-                            if replay_buffer.size == replay_buffer.capacity:
-                                replay_batch = replay_buffer.buffer
-                            else:
-                                replay_batch = replay_buffer.sample((replay_buffer.size // initial_batch_size)* initial_batch_size)
-                            self._update_critic(replay_batch, timing_raw, metrics)
-                            self._update_actor(replay_batch, timing_raw, metrics)
-                            print("end replay buffer")  
-
-                    if "actor/entropy_loss" in metrics:
-                        entropy = metrics["actor/entropy_loss"]  
 
                       
 

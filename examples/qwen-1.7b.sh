@@ -1,7 +1,7 @@
 set -x
 
-MODEL_PATH=Qwen3/Qwen3-4B
-NAME="Qwen3-4B-Distilled-RL"
+MODEL_PATH=Qwen3/Qwen3-1.7B
+NAME="Qwen3-1.7B-Distilled-RL"
 
 FORMAT_PROMPT="""You FIRST think about the reasoning process as an internal monologue and then provide the final answer. The reasoning process MUST BE enclosed within <think> </think> tags. The final answer MUST BE put in \boxed{}."""
 

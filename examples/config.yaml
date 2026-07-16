@@ -66,6 +66,19 @@ worker:
       enable_rank0_init: true
     offload:
       offload_params: false
+      
+  teacher:
+    use_teacher: false
+    model:
+      model_path: null
+      tokenizer_path: null
+    fsdp:
+      enable_full_shard: true
+      enable_cpu_offload: true
+      enable_rank0_init: true
+      # torch_dtype: bf16
+    offload:
+      offload_params: false
 
   reward:
     reward_type: function

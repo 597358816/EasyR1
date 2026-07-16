@@ -112,3 +112,18 @@ class RefConfig:
     ulysses_sequence_parallel_size: int = field(default=1, init=False)
     use_torch_compile: bool = field(default=True, init=False)
     entropy_from_logits_with_chunking: bool = field(default=False, init=False)
+
+
+@dataclass
+class TeacherConfig:
+    use_teacher: bool = False
+    strategy: str = "fsdp"
+    model: ModelConfig = field(default_factory=ModelConfig)
+    fsdp: FSDPConfig = field(default_factory=FSDPConfig)
+    offload: OffloadConfig = field(default_factory=OffloadConfig)
+    """auto keys"""
+    micro_batch_size_per_device_for_experience: int = field(default=-1, init=False)
+    padding_free: bool = field(default=False, init=False)
+    ulysses_sequence_parallel_size: int = field(default=1, init=False)
+    use_torch_compile: bool = field(default=True, init=False)
+    entropy_from_logits_with_chunking: bool = field(default=False, init=False)
