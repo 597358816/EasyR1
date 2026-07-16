@@ -6,10 +6,10 @@ export TMPDIR=/vepfs-mlp2/c20250203/250602012/tmp
 export PIP_CACHE_DIR=/vepfs-mlp2/c20250203/250602012/cache
 
 
-MODEL_PATH=/vepfs-mlp2/c20250203/250602012/models/Qwen/Qwen3-4B
-NAME="qwen3-4bbase8bGRPO-DRL-temperature"
+MODEL_PATH=/vepfs-mlp2/c20250203/250602012/models/Qwen/Qwen3-1.7B
+NAME="qwen3-1.7b-8bGRPO-DRL"
 
-CHECKPOINT_ROOT="/vepfs-mlp2/c20250203/250602012/checkpoints/OPD/Qwen3-4B/${NAME}"
+CHECKPOINT_ROOT="/vepfs-mlp2/c20250203/250602012/checkpoints/OPD/Qwen3-1.7B/${NAME}"
 LATEST_STEP_FILE="${CHECKPOINT_ROOT}/latest_global_step.txt"
 
 FORMAT_PROMPT="""You FIRST think about the reasoning process as an internal monologue and then provide the final answer. The reasoning process MUST BE enclosed within <think> </think> tags. The final answer MUST BE put in \boxed{}."""

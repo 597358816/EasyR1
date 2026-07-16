@@ -54,7 +54,7 @@ from ..utils.model_utils import print_gpu_memory_usage, print_model_size
 from ..utils.tokenizer import get_processor, get_tokenizer
 from ..utils.torch_dtypes import PrecisionType
 from ..utils.torch_functional import AnyPrecisionAdamW, get_constant_schedule_with_warmup
-from .config import ActorConfig, CriticConfig, FSDPConfig, ModelConfig, OptimConfig, RefConfig, WorkerConfig
+from .config import ActorConfig, CriticConfig, FSDPConfig, ModelConfig, OptimConfig, RefConfig, WorkerConfig, TeacherConfig
 from .rollout import vLLMRollout
 from .sharding_manager import FSDPVLLMShardingManager
 from .sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
@@ -64,7 +64,7 @@ class FSDPWorker(Worker):
     def __init__(
         self,
         config: WorkerConfig,
-        role: Literal["actor", "critic", "rollout", "ref", "actor_rollout", "actor_rollout_ref"],
+        role: Literal["actor", "critic", "rollout", "ref", "teacher", "actor_rollout", "actor_rollout_ref"],
     ):
         super().__init__()
         self.config = config
@@ -81,6 +81,7 @@ class FSDPWorker(Worker):
         self._is_critic = self.role == "critic"
         self._is_rollout = self.role in ["rollout", "actor_rollout", "actor_rollout_ref"]
         self._is_ref = self.role in ["ref", "actor_rollout_ref"]
+        self._is_teacher = self.role == "teacher"
 
         self._use_param_offload = False
         self._use_optimizer_offload = False
@@ -95,9 +96,12 @@ class FSDPWorker(Worker):
         elif self._is_ref:  # NOTE: it seems that manual offload is slower than FSDP offload
             self._use_param_offload = self.config.ref.offload.offload_params
             self._init_config(self.config.ref, "ref")
+        elif self._is_teacher:
+            self._use_param_offload = self.config.teacher.offload.offload_params
+            self._init_config(self.config.teacher, "teacher")
 
     def _init_config(
-        self, config: Union[ActorConfig, CriticConfig, RefConfig], role: Literal["actor", "critic", "ref"]
+        self, config: Union[ActorConfig, CriticConfig, RefConfig, TeacherConfig], role: Literal["actor", "critic", "ref", "teacher"]
     ):
         world_size = dist.get_world_size()
         fsdp_size = config.fsdp.fsdp_size
@@ -344,10 +348,16 @@ class FSDPWorker(Worker):
             optim_config = None
             padding_free = self.config.ref.padding_free
             role = "ref"
+        elif self._is_teacher:
+            model_config = self.config.teacher.model
+            fsdp_config = self.config.teacher.fsdp
+            optim_config = None
+            padding_free = self.config.teacher.padding_free
+            role = "teacher"
         else:
             raise ValueError(f"Unknown role {role}.")
 
-        if self._is_actor or self._is_critic or self._is_ref:
+        if self._is_actor or self._is_critic or self._is_ref or self._is_teacher:
             self._build_model_optimizer(
                 model_config=model_config,
                 fsdp_config=fsdp_config,
@@ -389,6 +399,14 @@ class FSDPWorker(Worker):
             self.ref_policy = DataParallelPPOActor(
                 config=self.config.ref,
                 actor_module=self.fsdp_module,
+            )
+        if self._is_teacher:
+            from .actor.dp_actor import DataParallelPPOActor
+
+            self.teacher_policy = DataParallelPPOActor(
+                config=self.config.teacher,
+                actor_module=self.fsdp_module,
+                actor_optimizer=None,
             )
 
         if self._is_actor or self._is_critic:
@@ -616,6 +634,39 @@ class FSDPWorker(Worker):
 
         # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
         # unshard the root FSDP module
+        if self.world_size > 1:
+            self.fsdp_module._handle.reshard(True)
+
+        if self._use_param_offload:
+            offload_fsdp_model(self.fsdp_module)
+
+        output = output.to("cpu")
+        return output
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def compute_teacher_log_probs(self, data: DataProto):
+        assert self._is_teacher
+
+        data = data.to(torch.cuda.current_device())
+
+        if self._use_param_offload:
+            load_fsdp_model(self.fsdp_module)
+
+        if "temperature" in data.meta_info:
+            temperature = data.meta_info["temperature"]
+        else:
+            temperature = self.config.rollout.temperature
+        data.meta_info["temperature"] = temperature
+
+        with self.ulysses_sharding_manager:
+            data = self.ulysses_sharding_manager.preprocess_data(data=data)
+            output = self.teacher_policy.compute_log_prob(data=data)
+            output = DataProto.from_dict(
+                tensors={"teacher_log_probs": output},
+                meta_info={"temperature": temperature},
+            )
+            output = self.ulysses_sharding_manager.postprocess_data(output)
+
         if self.world_size > 1:
             self.fsdp_module._handle.reshard(True)
 

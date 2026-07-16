@@ -53,6 +53,12 @@ class Runner:
             Role.Critic: ray.remote(FSDPWorker),
             Role.RefPolicy: ray.remote(FSDPWorker),
         }
+        if config.worker.teacher.use_teacher:
+            assert config.worker.teacher.model.model_path is not None, (
+                "worker.teacher.use_teacher=True, but worker.teacher.model.model_path is None."
+            )
+            role_worker_mapping[Role.Teacher] = ray.remote(FSDPWorker)
+
         global_pool_id = "global_pool"
         resource_pool_spec = {
             global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
@@ -62,6 +68,9 @@ class Runner:
             Role.Critic: global_pool_id,
             Role.RefPolicy: global_pool_id,
         }
+        if config.worker.teacher.use_teacher:
+            mapping[Role.Teacher] = global_pool_id 
+
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
         reward_fn = FunctionRewardManager(config=config.worker.reward, tokenizer=tokenizer)

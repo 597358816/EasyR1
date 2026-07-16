@@ -61,6 +61,7 @@ class Role(IntEnum):
     Critic = auto()
     RefPolicy = auto()
     RewardModel = auto()
+    Teacher = auto()
     ActorRolloutRef = auto()
 
 
@@ -393,6 +394,10 @@ class RayPPOTrainer:
             self.use_reference_policy = False
             self.kl_ctrl = core_algos.FixedKLController(init_kl_coef=0.0)
             print("KL is disabled, no KL metrics will be logged. Please set `kl_coef=0` to log KL metrics.")
+        self.use_teacher_policy = (
+            self.config.worker.teacher.use_teacher
+            and Role.Teacher in role_worker_mapping
+        )
 
         if config.algorithm.adv_estimator == AdvantageEstimator.GAE:
             self.use_critic = True
@@ -604,6 +609,15 @@ class RayPPOTrainer:
             )
             self.resource_pool_to_cls[resource_pool]["ref"] = ref_policy_cls
 
+        if self.use_teacher_policy:
+            resource_pool = self.resource_pool_manager.get_resource_pool(Role.Teacher)
+            teacher_policy_cls = RayClassWithInitArgs(
+                self.role_worker_mapping[Role.Teacher],
+                config=self.config.worker,
+                role="teacher",
+            )
+            self.resource_pool_to_cls[resource_pool]["teacher"] = teacher_policy_cls
+
         # create a reward model if reward_fn is None
         if self.use_reward_model:
             # we create a RM here
@@ -634,6 +648,10 @@ class RayPPOTrainer:
         if self.use_reference_policy:
             self.ref_policy_wg = all_wg["ref"]
             self.ref_policy_wg.init_model()
+            
+        if self.use_teacher_policy:
+            self.teacher_policy_wg = all_wg["teacher"]
+            self.teacher_policy_wg.init_model()
 
         if self.use_reward_model:
             self.rm_wg = all_wg["rm"]
@@ -900,7 +918,7 @@ class RayPPOTrainer:
 
             metrics["reward_var/reward"] = _mean_group_var(reward_tensor)
 
-            var = True
+            var = False
             if var:
                 metrics["reward_var/accuracy"] = _mean_group_var(accuracy_tensor)
                 metrics["reward_var/length"] = _mean_group_var(length_tensor)
@@ -939,6 +957,15 @@ class RayPPOTrainer:
                 ref_log_probs = self.ref_policy_wg.compute_ref_log_probs(batch)
                 batch = batch.union(ref_log_probs)
 
+    def _compute_teacher_log_probs(self, batch: DataProto, timing_raw):
+        if self.use_teacher_policy:
+            with _timer("teacher", timing_raw):
+                if "temperature" not in batch.meta_info:
+                    batch.meta_info["temperature"] = 1.0
+                teacher_log_probs = self.teacher_policy_wg.compute_teacher_log_probs(batch)
+                batch = batch.union(teacher_log_probs)
+        return batch
+
     def _compute_values(self, batch: DataProto, timing_raw):
         if self.use_critic:
             with _timer("values", timing_raw):
@@ -955,20 +982,6 @@ class RayPPOTrainer:
                 )
             else:
                 batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
-            #compute advantages, executed on the driver process
-            # print("compute advantage decoupled with reward, using token_level_scores and acc_scores")
-            # batch.batch["advantages"], batch.batch["returns"] = core_algos.compute_grpo_outcome_advantage(
-            #     batch.batch["acc_scores"],
-            #     batch.batch["response_mask"],
-            #     batch.non_tensor_batch["uid"]
-            # )
-            # len_adv, len_ret = core_algos.compute_grpo_outcome_advantage(
-            #     batch.batch["len_scores"],
-            #     batch.batch["response_mask"],
-            #     batch.non_tensor_batch["uid"]
-            # )
-            # batch.batch["advantages"] += len_adv
-            # batch.batch["returns"] += len_ret
             batch = compute_advantage(
                 batch,
                 adv_estimator=self.config.algorithm.adv_estimator,
@@ -986,7 +999,134 @@ class RayPPOTrainer:
                 dtype=torch.long,
                 device=dp.batch["advantages"].device
             )
+    def _apply_drl_importance_weight(
+        self,
+        batch: DataProto,
+        metrics: dict,
+        clip_ratio: float = 3.0,
+        rho_apply_to: str = "positive",  # "all", "positive", "negative"
+        if_normalized: bool = True,
+        temperature_as_teacher: bool = False
+    ):
+        old_log_probs = batch.batch["old_log_probs"]              # [B, T]
+        if temperature_as_teacher:
+            teacher_log_probs = batch.batch["old_log_probs_t"]    # [B, T] 
+        else:
+            teacher_log_probs = batch.batch["teacher_log_probs"]  # [B, T]
+        advantages = batch.batch["advantages"]                    # [B, T]
+        response_mask = batch.batch["response_mask"]              # [B, T]
 
+        valid_mask = response_mask.bool()
+        # token-level log rho: [B, T]
+        token_log_rho = teacher_log_probs - old_log_probs
+        # token-level raw rho: [B, T]
+        rho_raw = torch.exp(token_log_rho.clamp(min=-80.0, max=80.0))
+
+        clip_low = 1.0 / clip_ratio
+        clip_high = clip_ratio
+        # token-level clipped rho: [B, T]
+        rho_clipped = rho_raw.clamp(min=clip_low, max=clip_high)
+
+        if if_normalized:
+            eps = 1e-12
+            mask_float = valid_mask.to(rho_clipped.dtype)
+
+            # 在 log 空间计算每条 response 的平均 log-rho
+            log_rho_clipped = torch.log(rho_clipped.clamp_min(eps))
+
+            mean_log_rho_per_response = (
+                (log_rho_clipped * mask_float).sum(dim=-1, keepdim=True)
+                / mask_float.sum(dim=-1, keepdim=True).clamp_min(1.0)
+            )
+
+            # 除以每条 response 的 rho 几何均值
+            rho_clipped = torch.exp(
+                log_rho_clipped - mean_log_rho_per_response
+            )
+
+            # padding 位置保持权重为 1
+            rho_clipped = torch.where(
+                valid_mask,
+                rho_clipped,
+                torch.ones_like(rho_clipped),
+            )
+        # -------- choose where to apply rho --------
+        if rho_apply_to == "all":
+            apply_mask = valid_mask
+        elif rho_apply_to == "positive":
+            apply_mask = valid_mask & (advantages > 0)
+        elif rho_apply_to == "negative":
+            apply_mask = valid_mask & (advantages < 0)
+        else:
+            raise ValueError(
+                f"Unknown rho_apply_to={rho_apply_to}. "
+                "Expected one of: 'all', 'positive', 'negative'."
+            )
+
+        # positions not selected use weight 1.0
+        effective_rho = torch.ones_like(rho_clipped)
+        effective_rho = torch.where(apply_mask, rho_clipped, effective_rho)
+
+        # token-level reweighting
+        batch.batch["advantages"] = advantages * effective_rho
+
+        # -------- metrics --------
+        with torch.no_grad():
+            eps = 1e-12
+
+            valid_token_log_rho = token_log_rho[valid_mask].detach()
+            valid_rho_raw = rho_raw[valid_mask].detach()
+            valid_rho_clipped = rho_clipped[valid_mask].detach()
+
+            selected_rho = rho_clipped[apply_mask].detach()
+            selected_raw_rho = rho_raw[apply_mask].detach()
+
+            metrics["rho/apply_to"] = {"all": 0, "positive": 1, "negative": 2}[rho_apply_to]
+            metrics["rho/apply_frac"] = apply_mask.float().sum().item() / valid_mask.float().sum().clamp_min(1.0).item()
+
+            metrics["rho/token_rho_raw_min"] = valid_rho_raw.min().item()
+            metrics["rho/token_rho_raw_max"] = valid_rho_raw.max().item()
+            metrics["rho/token_rho_raw_mean"] = valid_rho_raw.mean().item()
+            metrics["rho/token_rho_raw_geomean"] = torch.exp(valid_token_log_rho.mean()).item()
+
+            metrics["rho/token_rho_clipped_min"] = valid_rho_clipped.min().item()
+            metrics["rho/token_rho_clipped_max"] = valid_rho_clipped.max().item()
+            metrics["rho/token_rho_clipped_mean"] = valid_rho_clipped.mean().item()
+            metrics["rho/token_rho_clipped_geomean"] = torch.exp(
+                torch.log(valid_rho_clipped.clamp_min(eps)).mean()
+            ).item()
+
+            metrics["rho/token_clip_low_frac"] = (valid_rho_raw < clip_low).float().mean().item()
+            metrics["rho/token_clip_high_frac"] = (valid_rho_raw > clip_high).float().mean().item()
+            metrics["rho/token_clip_frac"] = (
+                (valid_rho_raw < clip_low) | (valid_rho_raw > clip_high)
+            ).float().mean().item()
+
+            metrics["rho/token_log_rho_min"] = valid_token_log_rho.min().item()
+            metrics["rho/token_log_rho_max"] = valid_token_log_rho.max().item()
+            metrics["rho/token_log_rho_mean"] = valid_token_log_rho.mean().item()
+
+            # selected-only metrics
+            if selected_rho.numel() > 0:
+                metrics["rho/selected_rho_mean"] = selected_rho.mean().item()
+                metrics["rho/selected_rho_min"] = selected_rho.min().item()
+                metrics["rho/selected_rho_max"] = selected_rho.max().item()
+                metrics["rho/selected_clip_frac"] = (
+                    (selected_raw_rho < clip_low) | (selected_raw_rho > clip_high)
+                ).float().mean().item()
+            else:
+                metrics["rho/selected_rho_mean"] = 1.0
+                metrics["rho/selected_rho_min"] = 1.0
+                metrics["rho/selected_rho_max"] = 1.0
+                metrics["rho/selected_clip_frac"] = 0.0
+
+            # sequence-level log rho only for debugging, not used for clipping
+            seq_log_rho = (token_log_rho * response_mask.to(token_log_rho.dtype)).sum(dim=-1)
+            metrics["rho/seq_log_rho_min"] = seq_log_rho.detach().min().item()
+            metrics["rho/seq_log_rho_max"] = seq_log_rho.detach().max().item()
+            metrics["rho/seq_log_rho_mean"] = seq_log_rho.detach().mean().item()
+
+        return batch
 
     def fit(self):
         """
@@ -1069,18 +1209,51 @@ class RayPPOTrainer:
                         print("Failed to decode first response:", e)
 
 
-                    
-                    alg = "ICR_neg"
+                    alg = self.config.trainer.algorithm
                     entropy_base = 0.5
-                    if (self.global_step>162):
-                        print(exit1)
-                    if alg=="AEPO":
+                    if self.global_step > 162:
+                        print("Stop training")
+                        return
+                    
+                    if alg=="DRL":                   
+                        self._compute_old_log_probs(batch, timing_raw)
+                        self._compute_ref_log_probs(batch, timing_raw)
+                        self._compute_teacher_log_probs(batch, timing_raw)
+                        batch = self._apply_drl_importance_weight(
+                            batch=batch,
+                            metrics=metrics,
+                            clip_ratio=self.config.trainer.DRL_rho_clip,
+                            rho_apply_to=self.config.trainer.DRL_rho_sample,   # "all" / "positive" / "negative"
+                            if_normalized=self.config.trainer.DRL_rho_normalized,
+                            temperature_as_teacher=self.config.trainer.DRL_temperature_as_teacher,
+                        )
+                        self._update_critic(batch, timing_raw, metrics)
+                        self._update_actor(batch, timing_raw, metrics)
+                    elif alg=="DRL_temp":  
+                        temperature = 1          
+                        if entropy <= entropy_base:
+                            temperature = 1.2
+                        elif entropy > entropy_base:     
+                            temperature = 0.8
+                        metrics["temperature"] = temperature                    
+                        self._compute_old_log_probs(batch, timing_raw)
+                        self._compute_ref_log_probs(batch, timing_raw)
+                        self._compute_old_log_probs(batch, timing_raw, temperature = temperature)
+                        batch = self._apply_drl_importance_weight(
+                            batch=batch,
+                            metrics=metrics,
+                            clip_ratio=self.config.trainer.DRL_rho_clip,
+                            rho_apply_to=self.config.trainer.DRL_rho_sample,   # "all" / "positive" / "negative"
+                            if_normalized=self.config.trainer.DRL_rho_normalized,
+                            temperature_as_teacher=self.config.trainer.DRL_temperature_as_teacher,
+                        )
+                        self._update_critic(batch, timing_raw, metrics)
+                        self._update_actor(batch, timing_raw, metrics)
+                    elif alg=="AEPO":
                         delta = entropy_base - entropy   # entropy 小时 delta > 0，升温；反之降温
                         temperature = 1.0 - delta
                         temperature = max(0.8, min(1.2, temperature))
-                        # if entropy <= entropy_base:
-                        #     sample_num = 64
-                        # else:
+
                         sample_num = 64
                         print(f"entropy: {entropy:.4f}, temperature: {temperature:.4f}")
                         metrics["temperature"] = temperature
@@ -1150,71 +1323,6 @@ class RayPPOTrainer:
                         self._compute_ref_log_probs(batch, timing_raw)
                         self._update_critic(batch, timing_raw, metrics)
                         self._update_actor(batch, timing_raw, metrics)
-                    
-                    elif alg == "ICR_neg":
-                        B = len(batch)
-                        device = batch.batch["attention_mask"].device
-                        group_n = int(self.config.worker.rollout.n)
-                        lens = self._get_resp_lens(batch).to(torch.float32)
-
-                        num_groups = B // group_n
-                        lens_g = lens.view(num_groups, group_n)                 # [G, n]
-
-                        # 每组直接选择长度最短的样本，不区分正负样本
-                        _, min_pos = lens_g.min(dim=1)                          # [G]
-                        g_idx = torch.arange(num_groups, device=device, dtype=torch.long)
-                        sel_idx = g_idx * group_n + min_pos.to(torch.long)      # [G]
-
-                        adv = batch.batch["advantages"]                         # [B, D]
-
-                        k = int(sel_idx.numel())
-                        if k > 0:
-                            bonus = torch.tensor(64.0 / float(k), device=device, dtype=adv.dtype)
-
-                            # 用样本自身 advantage 的符号判断：
-                            # 正优势 +bonus，负优势 -bonus，零优势不动
-                            sel_adv_scalar = adv[sel_idx, :].mean(dim=1)        # [k]
-                            sign = torch.sign(sel_adv_scalar).to(adv.dtype)     # [k], in {-1,0,1}
-
-                            adv[sel_idx, :] += sign.unsqueeze(1) * bonus
-
-                            metrics["response_length/select_num"] = k
-                            metrics["response_length/selected_len"] = lens[sel_idx].mean().detach().item()
-                            metrics["response_length/selected_adv"] = sel_adv_scalar.mean().detach().item()
-                        else:
-                            metrics["response_length/select_num"] = 0
-
-                        batch.batch["advantages"] = adv
-
-                        self._compute_old_log_probs(batch, timing_raw)
-                        self._compute_ref_log_probs(batch, timing_raw)
-                        self._update_critic(batch, timing_raw, metrics)
-                        self._update_actor(batch, timing_raw, metrics)
-                    
-                    elif alg == "ICR_all":
-                        B = len(batch)
-                        device = batch.batch["attention_mask"].device
-                        lens = self._get_resp_lens(batch).to(torch.float32)
-
-                        adv = batch.batch["advantages"]                         # [B, D]
-
-                        sel_idx = torch.arange(B, device=device, dtype=torch.long)
-                        k = int(sel_idx.numel())
-
-                        if k > 0:
-                            bonus = torch.tensor(64.0 / float(k), device=device, dtype=adv.dtype)
-                            adv[sel_idx, :] += bonus
-                            metrics["response_length/select_num"] = k
-                            metrics["response_length/selected_len"] = lens[sel_idx].mean().detach().item()
-                        else:
-                            metrics["response_length/select_num"] = 0
-
-                        batch.batch["advantages"] = adv
-
-                        self._compute_old_log_probs(batch, timing_raw)
-                        self._compute_ref_log_probs(batch, timing_raw)
-                        self._update_critic(batch, timing_raw, metrics)
-                        self._update_actor(batch, timing_raw, metrics)
 
                         
                     elif alg=="DCPO":  
@@ -1256,17 +1364,9 @@ class RayPPOTrainer:
                         self._compute_ref_log_probs(batch, timing_raw)
                         self._update_critic(batch, timing_raw, metrics)
                         self._update_actor(batch, timing_raw, metrics)
+                    
                     elif alg=="GRPO":                   
                         self._compute_old_log_probs(batch, timing_raw)
-                        self._compute_ref_log_probs(batch, timing_raw)
-                        self._update_critic(batch, timing_raw, metrics)
-                        self._update_actor(batch, timing_raw, metrics)
-                    elif alg=="GRPO+REINFORCE":  
-                        _compute_bool_reward_by_score(batch, threshold = 0.05, absolute=False)
-                        self._compute_old_log_probs(batch, timing_raw)
-                        old_log_probs = batch.batch['old_log_probs']
-                        rate = 32 / sum(batch.batch["bool_reward"])
-                        batch.batch["advantages"] += rate * batch.batch["bool_reward"].to(batch.batch["advantages"].dtype).unsqueeze(1)
                         self._compute_ref_log_probs(batch, timing_raw)
                         self._update_critic(batch, timing_raw, metrics)
                         self._update_actor(batch, timing_raw, metrics)
@@ -1279,8 +1379,6 @@ class RayPPOTrainer:
                         self._compute_ref_log_probs(batch, timing_raw)
                         self._update_critic(batch, timing_raw, metrics)
                         self._update_actor(batch, timing_raw, metrics)
-                        
-                        
                     elif alg=="DAPO":     
                         if replay_buffer.capacity == 0:
                             replay_buffer.capacity =  2 * initial_batch_size

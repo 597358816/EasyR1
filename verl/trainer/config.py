@@ -81,6 +81,11 @@ class TrainerConfig:
     save_limit: int = -1
     save_checkpoint_path: Optional[str] = None
     load_checkpoint_path: Optional[str] = None
+    algorithm: str = "GRPO"
+    DRL_rho_sample: str = "positive"
+    DRL_rho_clip: float = 1.2
+    DRL_rho_normalized: bool = False
+    DRL_temperature_as_teacher: bool = False
 
     def post_init(self):
         if self.save_checkpoint_path is None:
