@@ -290,9 +290,6 @@ def compute_policy_loss(
     #min = torch.log(torch.tensor(1.0 - clip_ratio_low,dtype=ratio.dtype,device=ratio.device)),
     #max = torch.log(1.0 + torch.clamp(0.1*inverse_old_probs,max = 0.6))
     
-    clip_ratio_low = 0.2
-    clip_ratio_high = 0.2
-    
     ratio = torch.exp(negative_approx_kl)
 
     clipped_ratio = torch.exp(

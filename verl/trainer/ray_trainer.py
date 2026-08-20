@@ -334,7 +334,32 @@ def duplicate_gen_batch(batch: DataProto, n: int):
     else:
         return batch
 
-    
+def log_prompt_correctness_stats(batch: DataProto, group_n: int, metrics: dict, threshold: float = 0.05):
+    scores = batch.batch["token_level_scores"]
+    scores = scores.sum(dim=-1) if scores.ndim > 1 else scores
+
+    positive = scores > threshold
+    assert len(positive) % group_n == 0
+
+    groups = positive.view(-1, group_n)
+    correct_num = groups.sum(dim=1)
+
+    total = len(groups)
+    all_correct = (correct_num == group_n).sum().item()
+    all_wrong = (correct_num == 0).sum().item()
+    mixed = total - all_correct - all_wrong
+
+    metrics.update({
+        "prompt/all_correct_ratio": all_correct / total,
+        "prompt/all_wrong_ratio": all_wrong / total,
+        "prompt/mixed_ratio": mixed / total,
+    })
+
+    print(
+        f"Prompt stats: all_correct={all_correct / total:.3f}, "
+        f"all_wrong={all_wrong / total:.3f}, "
+        f"mixed={mixed / total:.3f}"
+    )    
 
 class RayPPOTrainer:
     """
@@ -1214,6 +1239,11 @@ class RayPPOTrainer:
                     if self.global_step > 162:
                         print("Stop training")
                         return
+                    log_prompt_correctness_stats(
+                        batch=batch,
+                        group_n=int(self.config.worker.rollout.n),
+                        metrics=metrics,
+                    )
                     
                     if alg=="DRL":                   
                         self._compute_old_log_probs(batch, timing_raw)
@@ -1250,8 +1280,7 @@ class RayPPOTrainer:
                         self._update_critic(batch, timing_raw, metrics)
                         self._update_actor(batch, timing_raw, metrics)
                     elif alg=="AEPO":
-                        delta = entropy_base - entropy   # entropy 小时 delta > 0，升温；反之降温
-                        temperature = 1.0 - delta
+                        temperature = 1.0 + entropy_base - entropy
                         temperature = max(0.8, min(1.2, temperature))
 
                         sample_num = 64
@@ -1268,22 +1297,162 @@ class RayPPOTrainer:
                         self._compute_values(batch_bak, timing_raw)
                         self._compute_adv(batch_bak, timing_raw)        
                         count_occurrences(batch_bak, "advantages")
-                        entropy_controller = _select_by_advantage_reverse(batch_bak, threshold = 0.05, absolute=False)
+                        entropy_controller = _select_by_advantage(batch_bak, threshold = 0.05, absolute=False)
                         sample_num = min(sample_num, len(entropy_controller))
-                        entropy_controller.batch["advantages"] = -1*torch.ones_like(entropy_controller.batch["advantages"])
+                        entropy_controller.batch["advantages"] = torch.ones_like(entropy_controller.batch["advantages"])
                         entropy_batch = DataProto.concat([entropy_controller[:sample_num], batch[sample_num:]])
                         self._compute_old_log_probs(entropy_batch, timing_raw)
-                        # self._compute_old_log_probs(entropy_batch, timing_raw, temperature = temperature)
-                        # old_log_probs = entropy_batch.batch['old_log_probs']
-                        # old_log_probs_t = entropy_batch.batch['old_log_probs_t']
-                        
-                        #entropy_batch.batch["advantages"][:sample_num] = entropy_batch.batch["advantages"][:sample_num] * torch.exp(old_log_probs[:sample_num] - old_log_probs_t[:sample_num])
-                        #entropy_batch.batch['old_log_probs'][:sample_num] = old_log_probs_t[:sample_num]
                         self._compute_ref_log_probs(entropy_batch, timing_raw)
             
                         self._update_critic(entropy_batch, timing_raw, metrics)
                         self._update_actor(entropy_batch, timing_raw, metrics) 
 
+                    elif alg=="AEPO-ab":
+                        temperature = 1.0 + entropy_base - entropy
+                        temperature = max(0.8, min(1.2, temperature))
+
+                        sample_num = 64
+                        print(f"entropy: {entropy:.4f}, temperature: {temperature:.4f}")
+                        metrics["temperature"] = temperature
+                        gen_batch_bak = gen_batch_bak[:len(gen_batch_bak) // 1]
+                        gen_batch_bak.meta_info["temperature"] = temperature
+                        
+                        with _timer("gen", timing_raw):  
+                            gen_batch_output_bak = self.actor_rollout_wg.generate_sequences(gen_batch_bak)
+                        batch_bak = batch_bak[:len(batch_bak) // 1].union(gen_batch_output_bak)   
+                        self._compute_reward(batch_bak, timing_raw, metrics)  
+                        batch_bak.meta_info["global_token_num"] = torch.sum(batch_bak.batch["attention_mask"], dim=-1).tolist()
+                        self._compute_values(batch_bak, timing_raw)
+                        self._compute_adv(batch_bak, timing_raw)        
+                        count_occurrences(batch_bak, "advantages")
+                        entropy_controller = _select_by_advantage(batch_bak, threshold = 0.05, absolute=False)
+                        sample_num = min(sample_num, len(entropy_controller))
+                        entropy_controller.batch["advantages"] = torch.ones_like(entropy_controller.batch["advantages"])
+
+
+                        entropy_batch = DataProto.concat([
+                            entropy_controller[:sample_num],
+                            batch[sample_num:]
+                        ])
+
+                        # Standard denominator for all samples.
+                        self._compute_old_log_probs(entropy_batch, timing_raw)
+                        self._compute_old_log_probs(entropy_batch, timing_raw, temperature = temperature)
+                        # Replace the denominator of auxiliary samples with
+                        # log pi_old^T collected or recomputed under the sampling temperature.
+                        entropy_batch.batch["old_log_probs"][:sample_num] = (
+                            entropy_batch.batch["old_log_probs_t"][:sample_num]
+                        )
+                        self._compute_ref_log_probs(entropy_batch, timing_raw)
+            
+                        self._update_critic(entropy_batch, timing_raw, metrics)
+                        self._update_actor(entropy_batch, timing_raw, metrics) 
+
+                    elif alg=="AEPO-ab":
+                        temperature = 1.0 + entropy_base - entropy
+                        temperature = max(0.8, min(1.2, temperature))
+
+                        sample_num = 64
+                        print(f"entropy: {entropy:.4f}, temperature: {temperature:.4f}")
+                        metrics["temperature"] = temperature
+                        gen_batch_bak = gen_batch_bak[:len(gen_batch_bak) // 1]
+                        gen_batch_bak.meta_info["temperature"] = temperature
+                        
+                        with _timer("gen", timing_raw):  
+                            gen_batch_output_bak = self.actor_rollout_wg.generate_sequences(gen_batch_bak)
+                        batch_bak = batch_bak[:len(batch_bak) // 1].union(gen_batch_output_bak)   
+                        self._compute_reward(batch_bak, timing_raw, metrics)  
+                        batch_bak.meta_info["global_token_num"] = torch.sum(batch_bak.batch["attention_mask"], dim=-1).tolist()
+                        self._compute_values(batch_bak, timing_raw)
+                        self._compute_adv(batch_bak, timing_raw)        
+                        count_occurrences(batch_bak, "advantages")
+                        entropy_controller = _select_by_advantage(batch_bak, threshold = 0.05, absolute=False)
+                        sample_num = min(sample_num, len(entropy_controller))
+                        entropy_controller.batch["advantages"] = torch.ones_like(entropy_controller.batch["advantages"])
+
+
+                        entropy_batch = DataProto.concat([
+                            entropy_controller[:sample_num],
+                            batch[sample_num:]
+                        ])
+
+                        # Standard denominator for all samples.
+                        self._compute_old_log_probs(entropy_batch, timing_raw)
+                        self._compute_old_log_probs(entropy_batch, timing_raw, temperature = temperature)
+                        # Replace the denominator of auxiliary samples with
+                        # log pi_old^T collected or recomputed under the sampling temperature.
+                        entropy_batch.batch["old_log_probs"][:sample_num] = (
+                            entropy_batch.batch["old_log_probs_t"][:sample_num]
+                        )
+                        self._compute_ref_log_probs(entropy_batch, timing_raw)
+            
+                        self._update_critic(entropy_batch, timing_raw, metrics)
+                        self._update_actor(entropy_batch, timing_raw, metrics) 
+
+                    elif alg=="AEPO-ab2":
+                        temperature = 1.0 + entropy_base - entropy
+                        temperature = max(0.8, min(1.2, temperature))
+
+                        sample_num = 64
+                        print(f"entropy: {entropy:.4f}, temperature: {temperature:.4f}")
+                        metrics["temperature"] = temperature
+                        gen_batch_bak = gen_batch_bak[:len(gen_batch_bak) // 1]
+                        gen_batch_bak.meta_info["temperature"] = temperature
+
+                        with _timer("gen", timing_raw):
+                            gen_batch_output_bak = self.actor_rollout_wg.generate_sequences(gen_batch_bak)
+
+                        batch_bak = batch_bak[:len(batch_bak) // 1].union(gen_batch_output_bak)
+                        self._compute_reward(batch_bak, timing_raw, metrics)
+                        batch_bak.meta_info["global_token_num"] = torch.sum(
+                            batch_bak.batch["attention_mask"], dim=-1
+                        ).tolist()
+                        self._compute_values(batch_bak, timing_raw)
+                        self._compute_adv(batch_bak, timing_raw)
+                        count_occurrences(batch_bak, "advantages")
+
+                        entropy_controller = _select_by_advantage(
+                            batch_bak,
+                            threshold=0.05,
+                            absolute=False
+                        )
+                        sample_num = min(sample_num, len(entropy_controller))
+                        entropy_controller.batch["advantages"] = torch.ones_like(
+                            entropy_controller.batch["advantages"]
+                        )
+
+                        entropy_batch = DataProto.concat([
+                            entropy_controller[:sample_num],
+                            batch[sample_num:]
+                        ])
+
+                        # Compute log pi_old and log pi_old^T.
+                        self._compute_old_log_probs(entropy_batch, timing_raw)
+                        self._compute_old_log_probs(
+                            entropy_batch,
+                            timing_raw,
+                            temperature=temperature
+                        )
+
+                        # Auxiliary importance weight:
+                        # pi_old / pi_old^T
+                        temperature_weight = torch.exp(
+                            entropy_batch.batch["old_log_probs"][:sample_num]
+                            - entropy_batch.batch["old_log_probs_t"][:sample_num]
+                        ).detach()
+
+                        # Keep the original ratio pi / pi_old, and multiply only the
+                        # auxiliary advantages by pi_old / pi_old^T.
+                        entropy_batch.batch["advantages"][:sample_num] = (
+                            entropy_batch.batch["advantages"][:sample_num]
+                            * temperature_weight
+                        )
+
+                        self._compute_ref_log_probs(entropy_batch, timing_raw)
+
+                        self._update_critic(entropy_batch, timing_raw, metrics)
+                        self._update_actor(entropy_batch, timing_raw, metrics)
+                    
 
                     elif alg == "ICR":
                         B = len(batch)
@@ -1428,62 +1597,7 @@ class RayPPOTrainer:
                         self._compute_reward(difficult_batch, timing_raw, metrics)
                         difficult_batch.meta_info["global_token_num"] = torch.sum(difficult_batch.batch["attention_mask"], dim=-1).tolist()
                         self._compute_values(difficult_batch, timing_raw)
-                        self._compute_adv(difficult_batch, timing_raw)
-#                         with torch.no_grad():
-#                             # 1) scalar reward per sample: 优先使用 token_level_scores.sum(dim=1)，否则尝试 rewards/scores
-#                             if "token_level_scores" in difficult_batch.batch:
-#                                 reward_scalar = difficult_batch.batch["token_level_scores"].sum(dim=1)
-#                             elif "rewards" in difficult_batch.batch:
-#                                 reward_scalar = difficult_batch.batch["rewards"]
-#                             elif "scores" in difficult_batch.batch:
-#                                 reward_scalar = difficult_batch.batch["scores"]
-#                             else:
-#                                 raise KeyError(
-#                                     "Cannot find reward tensor in difficult_batch.batch. "
-#                                     "Expected one of: token_level_scores / rewards / scores"
-#                                 )
-
-#                             # 正样本判定：reward > 0 视为正样本（按你之前的逻辑 values>0）
-#                             pos_mask = (reward_scalar > 0)
-
-#                             # 2) group by prompt (assume each prompt has rollout_n adjacent responses)
-#                             _rollout_n = rollout_n  # 这里 rollout_n = 40
-#                             _half = _rollout_n // 2  # 20
-
-#                             total_items = len(difficult_batch)
-#                             num_prompts = total_items // _rollout_n
-#                             valid_items = num_prompts * _rollout_n
-
-#                             if valid_items != total_items:
-#                                 print(f"[WARN] difficult_batch size {total_items} not divisible by rollout_n={_rollout_n}, "
-#                                       f"truncate to {valid_items} for stats.")
-
-#                             pos_mask = pos_mask[:valid_items].view(num_prompts, _rollout_n)  # [num_prompts, 40]
-
-#                             pos_first20 = pos_mask[:, :_half]          # [num_prompts, 20]
-#                             pos_last20  = pos_mask[:, _half:_rollout_n]# [num_prompts, 20]
-
-#                             solved_in_first20 = pos_first20.any(dim=1)  # [num_prompts]
-#                             solved_only_in_last20 = (~solved_in_first20) & (pos_last20.any(dim=1))
-
-#                             # 3) required stats
-#                             difficult_total = int(num_prompts)
-
-#                             solved_first20_cnt = int(solved_in_first20.sum().item())
-#                             # “对应的正样本数”：只统计这些“前20可解”的问题，在前20里出现的正样本总数
-#                             solved_first20_pos_cnt = int(pos_first20[solved_in_first20].sum().item())
-
-#                             harder_cnt = int(solved_only_in_last20.sum().item())
-#                             harder_pos_cnt = int(pos_last20[solved_only_in_last20].sum().item())
-#                             metrics["difficult/difficult_prompts"]=difficult_total
-#                             metrics["difficult/solvable_prompts"]=solved_first20_cnt
-#                             metrics["difficult/solvable_responses"]=solved_first20_pos_cnt
-#                             metrics["difficult/deeper_solvable_prompts"]=harder_cnt
-#                             metrics["difficult/deeper_solvable_responses"]=harder_pos_cnt
-#                             print(f"[EFRame][HardStats] difficult_prompts_total={difficult_total}")
-#                             print(f"[EFRame][HardStats] solved_in_first20={solved_first20_cnt}, pos_in_first20_for_those={solved_first20_pos_cnt}")
-#                             print(f"[EFRame][HardStats] solved_only_in_last20={harder_cnt}, pos_in_last20_for_those={harder_pos_cnt}")
-                            
+                        self._compute_adv(difficult_batch, timing_raw)                     
                             
                         count_occurrences(difficult_batch, "advantages")
                         difficult_batch = _select_by_advantage(difficult_batch, threshold = 0.5)

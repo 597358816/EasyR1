@@ -1,5 +1,6 @@
-MODEL_NAME="Qwen3-1.7B"
-
+# MODEL_NAME="Qwen2.5-7B"
+# MODEL_NAME="DSQW-1_5b"
+MODEL_NAME="Nemotron-7B"
 
 #for step in $(seq 200 10 270)
 #for step in $(seq 50 10 120)
@@ -8,7 +9,7 @@ MODEL_NAME="Qwen3-1.7B"
 for step in $(seq 20 20 160)
 do
     echo ${step}
-    RUN_NAME="qwen3-1.7b-GRPO-ref"
+    RUN_NAME="Nemotron-7B-GRPO"
     python3 ./scripts/model_merger.py --local_dir "/vepfs-mlp2/c20250203/250602012/checkpoints/OPD/${MODEL_NAME}/${RUN_NAME}/global_step_${step}/actor/"
 done
 
